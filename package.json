@@ -1,0 +1,32 @@
+{
+  "name": "discord-follow-translator-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production-minded Discord bot that translates followed announcement posts with DeepL and publishes Russian versions.",
+  "main": "dist/src/app/bootstrap.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/app/bootstrap.ts",
+    "start": "node dist/src/app/bootstrap.js",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.2.2",
+    "mime-types": "^3.0.1",
+    "nanoid": "^5.1.5",
+    "pino": "^9.9.0",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/mime-types": "^3.0.1",
+    "@types/node": "^24.6.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  }
+}
