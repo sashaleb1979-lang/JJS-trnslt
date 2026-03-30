@@ -11,8 +11,8 @@ export class TranslationSegmenter {
     textBlocks: CanonicalTextBlock[];
     sourceLang: string;
     targetLang: string;
-    glossaryId: string;
-    glossaryVersionId: string;
+    glossaryId?: string;
+    glossaryVersionId?: string;
     context: string;
   }): TranslationRequestPlan[] {
     const items = this.segmentBlocks(input.textBlocks);
