@@ -14,7 +14,7 @@ export class PublishRenderer {
     const title = this.resolveTitle(input.payload, input.translatedBlocks);
     const body = this.resolveBody(input.payload, input.translatedBlocks);
     const footer = `Источник: ${input.payload.detected_source_label} • ${
-      input.fallbackOriginal ? "Оригинал опубликован из-за ошибки перевода" : "Автоперевод DeepL"
+      input.fallbackOriginal ? "Оригинал (ошибка перевода)" : "Автоперевод DeepL"
     }`;
     const fileLinks = input.media.linkLines.length > 0 ? `\n\nВложения:\n${input.media.linkLines.join("\n")}` : "";
     const finalBody = sanitizeForDiscord(`${body}${fileLinks}`.trim());

@@ -18,6 +18,12 @@ export function detectSourceLabel(input: {
    * Only meaningful when isForwardedMessage is true.
    */
   originChannelName?: string | null;
+  /**
+   * The name of the origin guild/server, if available and different from the receiving guild.
+   * Used as a fallback attribution for cross-server forwards when the channel name is
+   * not resolvable from the local cache.
+   */
+  originGuildName?: string | null;
 }): SourceLabelResult {
   // Admin override always wins regardless of message type.
   if (input.mapping.source_label_override?.trim()) {
@@ -26,10 +32,17 @@ export function detectSourceLabel(input: {
 
   if (input.isForwardedMessage) {
     // For native-forward messages the forwarder's username is NOT a valid attribution.
-    // Use the origin channel name first, then any embed-level attribution, then a
-    // generic "Forwarded content" label. Never fall through to the author name.
+    // Priority:
+    //   a) origin channel name (same-server forwards where channel is in cache)
+    //   b) origin guild/server name (cross-server forwards where the channel is not in cache)
+    //   c) embed author name from the original post (e.g. announcement embed attribution)
+    //   d) embed footer text from the original post
+    //   e) generic "Forwarded content" – never use the forwarder's username
     if (input.originChannelName?.trim()) {
       return { label: input.originChannelName.trim(), origin: "forwarded_origin_channel" };
+    }
+    if (input.originGuildName?.trim()) {
+      return { label: input.originGuildName.trim(), origin: "forwarded_origin_guild" };
     }
     if (input.embedAuthorName?.trim()) {
       return { label: input.embedAuthorName.trim(), origin: "embed_author" };
