@@ -258,16 +258,19 @@ export class CommandRouter {
     }
 
     const activeGlossary = this.repositories.glossaryVersions.getActiveByPair(interaction.guildId!, sourceLang, targetLang);
-    const pauseReason = activeGlossary ? null : "Нет активного glossary. Добавьте правило через /glossary add и затем выполните /resume.";
     const existing = this.repositories.channelMappings.getByRawChannelId(rawChannel.id);
     const mappingId = existing?.mapping_id ?? createId("map");
+
+    const glossaryNote = activeGlossary
+      ? `Glossary: active ${activeGlossary.glossary_version_id}`
+      : "Glossary: нет активной версии — перевод будет выполняться без глоссария (добавьте термины через /glossary add)";
 
     const summaryLines = [
       `Guild: ${interaction.guild!.name}`,
       `Raw: #${rawChannel.name}`,
       `Output: #${outputChannel.name}`,
       `Pair: ${sourceLang} -> ${targetLang}`,
-      activeGlossary ? `Glossary: active ${activeGlossary.glossary_version_id}` : "Glossary: пока нет активной версии, mapping будет paused",
+      glossaryNote,
       `Log channel: ${logChannel ? `#${logChannel.name}` : this.config.logChannelId ? `ENV ${this.config.logChannelId}` : "not set"}`,
     ];
 
@@ -283,7 +286,7 @@ export class CommandRouter {
       adminRoleIdsJson: JSON.stringify(this.config.adminRoleIds),
       logChannelId: logChannel?.id ?? this.config.logChannelId ?? null,
       publishOriginalOnFailure: this.config.publishOriginalOnExhaustedTransientFailure,
-      status: activeGlossary ? "active" : "degraded",
+      status: "active",
     });
     this.repositories.channelMappings.upsert({
       mappingId,
@@ -296,8 +299,8 @@ export class CommandRouter {
       activeGlossaryVersionId: activeGlossary?.glossary_version_id ?? null,
       renderMode: "auto",
       mediaMode: "auto",
-      isPaused: !activeGlossary,
-      pauseReason,
+      isPaused: false,
+      pauseReason: null,
     });
     this.repositories.auditLog.insert({
       guildId: interaction.guildId!,
@@ -316,7 +319,7 @@ export class CommandRouter {
     });
 
     await interaction.reply({
-      content: `Mapping сохранен.\n${summaryLines.join("\n")}${pauseReason ? `\n\nПричина паузы: ${pauseReason}` : ""}`,
+      content: `Mapping сохранен.\n${summaryLines.join("\n")}`,
       ephemeral: true,
     });
   }
@@ -328,12 +331,39 @@ export class CommandRouter {
     const mappings = rawChannel
       ? [this.resolveSingleMapping(interaction.guildId!, rawChannel.id)]
       : this.repositories.channelMappings.listByGuildId(interaction.guildId!);
+    const MAX_ERROR_MESSAGE_LENGTH = 60;
+    const MAX_FAILURE_SUMMARY_LENGTH = 80;
 
     const mappingLines = mappings
       .filter(Boolean)
-      .map((mapping) => {
-        const latest = this.repositories.processedRawMessages.getLatestForMapping(mapping!.mapping_id);
-        return `- raw <#${mapping!.raw_channel_id}> -> output <#${mapping!.output_channel_id}> | paused=${mapping!.is_paused === 1} | glossary=${mapping!.active_glossary_version_id ?? "none"} | latest=${latest?.raw_message_id ?? "none"}`;
+      .flatMap((mapping) => {
+        const m = mapping!;
+        const latest = this.repositories.processedRawMessages.getLatestForMapping(m.mapping_id);
+        const recentJobs = this.repositories.translationJobs.listRecentByMappingId(m.mapping_id, 3);
+        const pendingCount = this.repositories.translationJobs.countByMappingAndStatus(m.mapping_id, "pending");
+        const retryCount = this.repositories.translationJobs.countByMappingAndStatus(m.mapping_id, "retry_wait");
+        const failedCount = this.repositories.translationJobs.countByMappingAndStatus(m.mapping_id, "failed");
+
+        const header = `- raw <#${m.raw_channel_id}> → output <#${m.output_channel_id}> | paused=${m.is_paused === 1} | glossary=${m.active_glossary_version_id ?? "none"}`;
+        const jobSummary = `  jobs: pending=${pendingCount} retry=${retryCount} failed=${failedCount} | latest_raw=${latest?.raw_message_id ?? "none"}`;
+
+        const diagLines: string[] = [header, jobSummary];
+
+        if (verbose && recentJobs.length > 0) {
+          diagLines.push("  recent jobs:");
+          for (const job of recentJobs) {
+            const errPart = job.last_error_code ? ` err=${job.last_error_code}: ${(job.last_error_message ?? "").slice(0, MAX_ERROR_MESSAGE_LENGTH)}` : "";
+            diagLines.push(`    [${job.status}] attempt=${job.attempt_count} updated=${job.updated_at}${errPart}`);
+          }
+        } else if (verbose && latest && recentJobs.length === 0) {
+          diagLines.push("  recent jobs: none (raw messages received but no jobs created — check gateway logs)");
+        }
+
+        if (m.is_paused === 1 && m.pause_reason) {
+          diagLines.push(`  pause reason: ${m.pause_reason}`);
+        }
+
+        return diagLines;
       });
 
     const lines = [
@@ -355,7 +385,7 @@ export class CommandRouter {
     if (verbose) {
       const recentFailures = this.repositories.failedJobs.listRecent(5);
       lines.push("", "Recent failures:");
-      lines.push(...(recentFailures.length > 0 ? recentFailures.map((failure) => `- ${failure.failure_code}: ${failure.failure_summary}`) : ["- none"]));
+      lines.push(...(recentFailures.length > 0 ? recentFailures.map((failure) => `- [${failure.failure_code}] ${failure.failure_summary.slice(0, MAX_FAILURE_SUMMARY_LENGTH)} (attempt=${failure.attempt_count})`) : ["- none"]));
     }
 
     await interaction.reply({ content: lines.join("\n").slice(0, 1_950), ephemeral: true });
@@ -373,13 +403,6 @@ export class CommandRouter {
   private async handleResume(interaction: ChatInputCommandInteraction): Promise<void> {
     const mappings = this.resolveMappingsForControl(interaction);
     for (const mapping of mappings) {
-      if (!mapping.active_glossary_version_id) {
-        throw new AppError({
-          code: "RESUME_BLOCKED_NO_GLOSSARY",
-          message: `Нельзя снять паузу с mapping ${mapping.mapping_id}: нет активного glossary.`,
-          failureClass: "validation",
-        });
-      }
       await this.glossaryManager.validateLanguagePair(mapping.source_lang, mapping.target_lang);
       this.repositories.channelMappings.setPaused(mapping.mapping_id, false, null);
     }
