@@ -1,17 +1,38 @@
-import { Message } from "discord.js";
+import { Message, MessageSnapshot } from "discord.js";
 import { ChannelMappingRow, PostPayload } from "../domain/types";
 import { nowIso } from "../utils/time";
 import { extractUrls, normalizeWhitespace } from "../utils/text";
 import { buildContentChecksum, buildDedupeKey } from "./checksum";
 import { detectSourceLabel } from "./source-label";
-import { hasMessageSnapshots } from "./message-filter";
+import { getFirstSnapshot, hasMessageSnapshots } from "./message-filter";
 
 export class MessageCanonicalizer {
   canonicalize(message: Message, mapping: ChannelMappingRow, followConfidence: "high" | "medium" | "low"): PostPayload {
     const receivedAt = nowIso();
     const canonicalizedAt = nowIso();
-    const contentText = normalizeWhitespace(message.content ?? "");
-    const embeds = message.embeds.map((embed, index) => ({
+
+    // ------------------------------------------------------------------ //
+    // Native Discord forwards (2024+): the actual message content lives   //
+    // in the first message snapshot, NOT in message.content / embeds.     //
+    // ------------------------------------------------------------------ //
+    const isNativeForward = hasMessageSnapshots(message);
+    const snapshot: MessageSnapshot | undefined = isNativeForward ? getFirstSnapshot(message) : undefined;
+
+    // "Effective" content: snapshot text takes priority for native forwards.
+    // The outer message.content may carry an optional forwarder comment which
+    // we append as a secondary block below.
+    const snapshotText = snapshot ? normalizeWhitespace(snapshot.content ?? "") : "";
+    const outerContentText = normalizeWhitespace(message.content ?? "");
+
+    // Primary text for the `content` field is the snapshot body (if native
+    // forward) or the regular outer content.
+    const primaryContentText = isNativeForward ? snapshotText : outerContentText;
+
+    // Effective embeds: use snapshot embeds for native forwards; fall back to
+    // the message's own embeds for crosspost / follow / shared messages.
+    const effectiveEmbeds = isNativeForward && snapshot ? snapshot.embeds : message.embeds;
+
+    const embeds = effectiveEmbeds.map((embed, index) => ({
       embed_index: index,
       type: embed.data.type ?? "rich",
       title: embed.title ?? null,
@@ -26,7 +47,10 @@ export class MessageCanonicalizer {
       url: embed.url ?? null,
       image_url: embed.image?.url ?? embed.thumbnail?.url ?? null,
     }));
-    const attachments = message.attachments.map((attachment) => ({
+
+    // Effective attachments: snapshot attachments for native forwards, else message attachments.
+    const effectiveAttachmentCollection = isNativeForward && snapshot ? snapshot.attachments : message.attachments;
+    const attachments = effectiveAttachmentCollection.map((attachment) => ({
       attachment_id: attachment.id,
       filename: attachment.name ?? attachment.id,
       content_type: attachment.contentType ?? null,
@@ -39,6 +63,56 @@ export class MessageCanonicalizer {
 
     const outputChannel = message.guild?.channels.cache.get(mapping.output_channel_id);
     const rawFlags = Array.from(message.flags.toArray(), (flag) => flag.toString());
+
+    // ------------------------------------------------------------------ //
+    // Source label: for native forwards we try to resolve the origin      //
+    // channel name rather than using the forwarder's username.            //
+    // ------------------------------------------------------------------ //
+    const originChannelId = message.reference?.channelId ?? null;
+    const originChannelRaw = originChannelId ? message.guild?.channels.cache.get(originChannelId) : undefined;
+    const originChannelName = originChannelRaw && "name" in originChannelRaw ? (originChannelRaw.name ?? null) : null;
+
+    // Build the jump URL for the original message if we have full coordinates.
+    const originGuildId = message.reference?.guildId ?? null;
+    const originMessageId = message.reference?.messageId ?? null;
+    const originJumpUrl =
+      originGuildId && originChannelId && originMessageId ?
+        `https://discord.com/channels/${originGuildId}/${originChannelId}/${originMessageId}`
+      : null;
+
+    const sourceLabelResult = detectSourceLabel({
+      mapping,
+      authorName: message.author.username,
+      embedAuthorName: embeds[0]?.author_name ?? null,
+      embedFooterText: embeds[0]?.footer_text ?? null,
+      isForwardedMessage: isNativeForward,
+      originChannelName,
+    });
+
+    // ------------------------------------------------------------------ //
+    // Text blocks and content diagnostics                                 //
+    // ------------------------------------------------------------------ //
+    const textBlocks = this.extractTextBlocks(primaryContentText, embeds, isNativeForward ? outerContentText : null);
+
+    // Determine the diagnostic content_text_source for logging.
+    let contentTextSource: PostPayload["content_text_source"];
+    if (isNativeForward) {
+      if (snapshotText) {
+        contentTextSource = "snapshot";
+      } else if (embeds.length > 0) {
+        contentTextSource = "embeds_only";
+      } else {
+        contentTextSource = "empty";
+      }
+    } else {
+      if (outerContentText) {
+        contentTextSource = "message_content";
+      } else if (embeds.length > 0) {
+        contentTextSource = "embeds_only";
+      } else {
+        contentTextSource = "empty";
+      }
+    }
 
     const payload: PostPayload = {
       schema_version: 1,
@@ -72,11 +146,11 @@ export class MessageCanonicalizer {
         edited_timestamp: message.editedAt?.toISOString() ?? null,
       },
       origin_reference: {
-        origin_guild_id: message.reference?.guildId ?? null,
-        origin_channel_id: message.reference?.channelId ?? null,
-        origin_message_id: message.reference?.messageId ?? null,
-        origin_jump_url: null,
-        reference_type: hasMessageSnapshots(message) ? "forwarded" : message.reference ? "follow_crosspost" : null,
+        origin_guild_id: originGuildId,
+        origin_channel_id: originChannelId,
+        origin_message_id: originMessageId,
+        origin_jump_url: originJumpUrl,
+        reference_type: isNativeForward ? "forwarded" : message.reference ? "follow_crosspost" : null,
       },
       source_markers: {
         has_webhook_id: Boolean(message.webhookId),
@@ -85,14 +159,14 @@ export class MessageCanonicalizer {
         follow_confidence: followConfidence,
       },
       content: {
-        raw_text: message.content ?? "",
-        normalized_text: contentText,
-        is_empty: !contentText,
+        raw_text: isNativeForward ? (snapshot?.content ?? "") : (message.content ?? ""),
+        normalized_text: primaryContentText,
+        is_empty: !primaryContentText,
       },
       embeds,
       attachments,
       urls: [
-        ...extractUrls(message.content ?? "").map((url) => ({ url, source: "content" as const, kind: "external_link" as const })),
+        ...extractUrls(primaryContentText).map((url) => ({ url, source: "content" as const, kind: "external_link" as const })),
         ...embeds
           .flatMap((embed) => [embed.url, embed.image_url].filter(Boolean))
           .map((url) => ({ url: url!, source: "embed" as const, kind: "external_link" as const })),
@@ -108,13 +182,10 @@ export class MessageCanonicalizer {
         channel_ids: message.mentions.channels.map((channel) => channel.id),
         mention_everyone: message.mentions.everyone,
       },
-      text_blocks: this.extractTextBlocks(contentText, embeds),
-      detected_source_label: detectSourceLabel({
-        mapping,
-        authorName: message.author.username,
-        embedAuthorName: embeds[0]?.author_name ?? null,
-        embedFooterText: embeds[0]?.footer_text ?? null,
-      }),
+      text_blocks: textBlocks,
+      detected_source_label: sourceLabelResult.label,
+      detected_source_label_origin: sourceLabelResult.origin,
+      content_text_source: contentTextSource,
       translation: {
         status: "pending",
         source_lang_configured: mapping.source_lang,
@@ -137,14 +208,27 @@ export class MessageCanonicalizer {
     return payload;
   }
 
-  private extractTextBlocks(contentText: string, embeds: PostPayload["embeds"]): PostPayload["text_blocks"] {
+  /**
+   * Build the ordered list of translatable text blocks.
+   *
+   * @param primaryContentText - The main body text (from snapshot or message.content).
+   * @param embeds             - Canonicalized embeds (already resolved from snapshot or message).
+   * @param forwarderComment   - Optional outer message content when the primary text comes from a
+   *                            snapshot (i.e. the forwarder added their own note). Appended as a
+   *                            separate block so it is translated but clearly distinguished.
+   */
+  private extractTextBlocks(
+    primaryContentText: string,
+    embeds: PostPayload["embeds"],
+    forwarderComment: string | null = null,
+  ): PostPayload["text_blocks"] {
     const blocks: PostPayload["text_blocks"] = [];
 
-    if (contentText) {
+    if (primaryContentText) {
       blocks.push({
         block_id: "content:0",
         block_type: "content_body",
-        source_text: contentText,
+        source_text: primaryContentText,
         preserve_markdown: true,
       });
     }
@@ -199,6 +283,17 @@ export class MessageCanonicalizer {
             preserve_markdown: true,
           });
         }
+      });
+    }
+
+    // Forwarder's optional comment (the text they typed when forwarding the message).
+    // Appended last so the translated output leads with the original content.
+    if (forwarderComment) {
+      blocks.push({
+        block_id: "content:forwarder_comment",
+        block_type: "content_body",
+        source_text: forwarderComment,
+        preserve_markdown: true,
       });
     }
 

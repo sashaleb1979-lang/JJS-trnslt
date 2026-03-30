@@ -310,6 +310,10 @@ export interface PostPayload {
   mentions: CanonicalMentions;
   text_blocks: CanonicalTextBlock[];
   detected_source_label: string;
+  /** Diagnostic: which field was used to determine the source label (for logging). */
+  detected_source_label_origin?: string;
+  /** Diagnostic: where the primary translatable text was extracted from (for logging). */
+  content_text_source?: "snapshot" | "message_content" | "embeds_only" | "empty";
   translation: {
     status: string;
     source_lang_configured: string;

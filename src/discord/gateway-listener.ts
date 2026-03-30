@@ -75,6 +75,29 @@ export class GatewayListener {
     }
 
     const payload = this.canonicalizer.canonicalize(message, mapping, decision.confidence);
+
+    // Log diagnostic information about the canonicalized message so operators can
+    // trace where the text and source label came from.
+    this.logger.info(
+      {
+        event: "message_canonicalized",
+        raw_message_id: payload.raw_message.message_id,
+        accept_reason: decision.reason,
+        follow_confidence: decision.confidence,
+        reference_type: payload.origin_reference.reference_type,
+        is_native_forward: payload.origin_reference.reference_type === "forwarded",
+        content_text_source: payload.content_text_source,
+        content_is_empty: payload.content.is_empty,
+        text_blocks_count: payload.text_blocks.length,
+        detected_source_label: payload.detected_source_label,
+        detected_source_label_origin: payload.detected_source_label_origin,
+        origin_channel_id: payload.origin_reference.origin_channel_id,
+        origin_jump_url: payload.origin_reference.origin_jump_url,
+      },
+      payload.content.is_empty ?
+        "Message canonicalized with empty content — no translatable text blocks found"
+      : "Message canonicalized",
+    );
     const stableDuplicate =
       payload.origin_reference.origin_message_id ?
         this.repositories.processedRawMessages.findStableDuplicate(mapping.mapping_id, payload.checksums.dedupe_key, message.id)
