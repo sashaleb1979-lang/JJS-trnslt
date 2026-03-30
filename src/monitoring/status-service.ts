@@ -79,6 +79,7 @@ export class StatusService {
 
   logSummary(): void {
     const report = this.buildReport();
+    const blockedJobs = this.repositories.translationJobs.countBlockedByPausedMappings();
     this.logger.info(
       {
         event: "health_report",
@@ -86,8 +87,18 @@ export class StatusService {
         queue_depth: report.queueDepth,
         active_mappings: report.activeMappings,
         paused_mappings: report.pausedMappings,
+        jobs_blocked_by_paused_mappings: blockedJobs,
       },
       "Health report snapshot",
     );
+    if (blockedJobs > 0) {
+      this.logger.warn(
+        {
+          event: "jobs_blocked_paused_mappings",
+          blocked_count: blockedJobs,
+        },
+        `${blockedJobs} job(s) are blocked because their channel mapping is paused — use /resume or /status verbose=true to diagnose`,
+      );
+    }
   }
 }

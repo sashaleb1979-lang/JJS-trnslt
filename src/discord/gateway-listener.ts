@@ -177,15 +177,21 @@ export class GatewayListener {
     });
 
     this.repositories.translationJobs.enqueue(payload.raw_message.message_id, mapping.mapping_id);
-    this.logger.info(
-      {
-        event: "job_created",
-        raw_message_id: payload.raw_message.message_id,
-        mapping_id: mapping.mapping_id,
-        accept_reason: decision.reason,
-        follow_confidence: decision.confidence,
-      },
-      "Translation job created",
-    );
+    const jobLogData = {
+      event: "job_created",
+      raw_message_id: payload.raw_message.message_id,
+      mapping_id: mapping.mapping_id,
+      accept_reason: decision.reason,
+      follow_confidence: decision.confidence,
+      mapping_is_paused: mapping.is_paused === 1,
+    };
+    if (mapping.is_paused === 1) {
+      this.logger.warn(
+        jobLogData,
+        `Translation job created but mapping is PAUSED — job will not be processed until mapping is resumed (pause_reason: ${mapping.pause_reason ?? "unknown"})`,
+      );
+    } else {
+      this.logger.info(jobLogData, "Translation job created");
+    }
   }
 }

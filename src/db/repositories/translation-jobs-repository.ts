@@ -154,6 +154,35 @@ export class TranslationJobsRepository {
     return row?.count ?? 0;
   }
 
+  listRecentByMappingId(mappingId: string, limit = 5): TranslationJobRow[] {
+    return this.db
+      .prepare<[string, number], TranslationJobRow>(
+        "SELECT * FROM translation_jobs WHERE mapping_id = ? ORDER BY updated_at DESC LIMIT ?",
+      )
+      .all(mappingId, limit);
+  }
+
+  countByMappingAndStatus(mappingId: string, status: string): number {
+    const row = this.db
+      .prepare<[string, string], { count: number }>(
+        "SELECT COUNT(*) AS count FROM translation_jobs WHERE mapping_id = ? AND status = ?",
+      )
+      .get(mappingId, status);
+    return row?.count ?? 0;
+  }
+
+  countBlockedByPausedMappings(): number {
+    const row = this.db
+      .prepare<unknown[], { count: number }>(
+        `SELECT COUNT(*) AS count
+         FROM translation_jobs j
+         INNER JOIN channel_mappings m ON m.mapping_id = j.mapping_id
+         WHERE j.status IN ('pending', 'retry_wait') AND m.is_paused = 1`,
+      )
+      .get();
+    return row?.count ?? 0;
+  }
+
   getOldestPending(): TranslationJobRow | null {
     return (
       this.db
