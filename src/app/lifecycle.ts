@@ -114,6 +114,8 @@ export class BotApplication {
     this.client.on("interactionCreate", (interaction) => {
       if (interaction.isChatInputCommand()) {
         void this.commandRouter.handleInteraction(interaction);
+      } else if (interaction.isModalSubmit() && interaction.customId.startsWith("glossary_import|")) {
+        void this.commandRouter.handleGlossaryImportModal(interaction);
       }
     });
 

@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { GlossaryRuleRow } from "../../domain/types";
 import { GlossaryRuleType } from "../../domain/enums";
+import { BulkImportEntry } from "../../translation/glossary-bulk-importer";
 import { createId } from "../../utils/ids";
 import { nowIso } from "../../utils/time";
 
@@ -94,5 +95,71 @@ export class GlossaryRulesRepository {
       .run(userId, nowIso(), guildId, sourceLang, targetLang, sourceTerm);
 
     return result.changes > 0;
+  }
+
+  /**
+   * Apply a batch of entries to the glossary in a single DB transaction.
+   *
+   * - Exact duplicates (same source_term, mode, target_term) are skipped.
+   * - If replaceExisting=false, conflicting rules are also skipped.
+   * - If replaceExisting=true, conflicting rules are archived and replaced.
+   */
+  bulkUpsertRules(input: {
+    guildId: string;
+    sourceLang: string;
+    targetLang: string;
+    entries: BulkImportEntry[];
+    replaceExisting: boolean;
+    userId: string;
+  }): { added: number; updated: number; skipped: number } {
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
+
+    const tx = this.db.transaction(() => {
+      for (const entry of input.entries) {
+        const existing = this.getActiveRule(input.guildId, input.sourceLang, input.targetLang, entry.sourceTerm);
+
+        if (existing) {
+          const isExactDuplicate = existing.rule_type === entry.mode && existing.target_term === entry.targetTerm;
+          if (isExactDuplicate) {
+            skipped++;
+            continue;
+          }
+          if (!input.replaceExisting) {
+            skipped++;
+            continue;
+          }
+          // Archive old rule and add updated version
+          this.archiveRule(input.guildId, input.sourceLang, input.targetLang, entry.sourceTerm, input.userId);
+          this.addRule({
+            guildId: input.guildId,
+            sourceLang: input.sourceLang,
+            targetLang: input.targetLang,
+            ruleType: entry.mode,
+            sourceTerm: entry.sourceTerm,
+            targetTerm: entry.targetTerm,
+            notes: null,
+            userId: input.userId,
+          });
+          updated++;
+        } else {
+          this.addRule({
+            guildId: input.guildId,
+            sourceLang: input.sourceLang,
+            targetLang: input.targetLang,
+            ruleType: entry.mode,
+            sourceTerm: entry.sourceTerm,
+            targetTerm: entry.targetTerm,
+            notes: null,
+            userId: input.userId,
+          });
+          added++;
+        }
+      }
+    });
+
+    tx();
+    return { added, updated, skipped };
   }
 }
