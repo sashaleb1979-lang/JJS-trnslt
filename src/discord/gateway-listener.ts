@@ -151,6 +151,8 @@ export class GatewayListener {
         event: "job_created",
         raw_message_id: payload.raw_message.message_id,
         mapping_id: mapping.mapping_id,
+        accept_reason: decision.reason,
+        follow_confidence: decision.confidence,
       },
       "Translation job created",
     );
