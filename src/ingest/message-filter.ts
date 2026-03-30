@@ -1,4 +1,4 @@
-import { Message, MessageFlags } from "discord.js";
+import { Message, MessageFlags, MessageSnapshot } from "discord.js";
 import { ChannelMappingRow } from "../domain/types";
 
 export interface MessageFilterDecision {
@@ -16,6 +16,19 @@ export interface MessageFilterDecision {
 export function hasMessageSnapshots(message: Message): boolean {
   const snapshots = (message as unknown as { messageSnapshots?: { size: number } }).messageSnapshots;
   return (snapshots?.size ?? 0) > 0;
+}
+
+/**
+ * Returns the first MessageSnapshot for a natively-forwarded message, or undefined
+ * if the message has no snapshots.
+ *
+ * The snapshot carries the original message's content, embeds, and attachments and
+ * is the canonical source of truth for native Discord forwards.
+ */
+export function getFirstSnapshot(message: Message): MessageSnapshot | undefined {
+  // discord.js guarantees messageSnapshots is always a Collection (never undefined),
+  // but we guard defensively in case an older gateway payload omits the field.
+  return message.messageSnapshots?.first();
 }
 
 /**
