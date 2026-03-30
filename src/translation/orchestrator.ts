@@ -1,5 +1,5 @@
 import { Logger } from "pino";
-import { AppError } from "../domain/errors";
+import { AppError, isAppError } from "../domain/errors";
 import { AppConfig, AppRepositories, ChannelMappingRow, PostPayload, PublishPlan, TranslationJobRow, TranslationResult } from "../domain/types";
 import { MetricsService } from "../monitoring/metrics";
 import { AttachmentHandler } from "../publish/attachment-handler";
@@ -12,6 +12,10 @@ import { DeepLClient } from "./deepl-client";
 import { GlossaryManager } from "./glossary-manager";
 import { TranslationResponseValidator } from "./response-validator";
 import { TranslationSegmenter } from "./segmenter";
+
+// Error codes from GlossaryManager that indicate no usable glossary is available.
+// When any of these are thrown, translation continues without a glossary.
+const GLOSSARY_UNAVAILABLE_CODES = new Set(["GLOSSARY_NOT_CONFIGURED", "GLOSSARY_NOT_READY", "GLOSSARY_PAIR_UNSUPPORTED"]);
 
 export interface OrchestrationResult {
   type: "published" | "duplicate" | "skipped";
@@ -162,21 +166,46 @@ export class TranslationOrchestrator {
   }
 
   private async translatePayload(payload: PostPayload, mapping: ChannelMappingRow): Promise<TranslationResult> {
-    const glossaryVersion = await this.glossaryManager.ensureUsableGlossary(mapping);
+    // Glossary is optional — attempt to get one but fall back to glossary-free
+    // translation if none is configured or not yet ready. This ensures messages
+    // are always translated rather than blocked by a missing glossary.
+    let glossaryId: string | undefined;
+    let glossaryVersionId: string | undefined;
+
+    try {
+      const glossaryVersion = await this.glossaryManager.ensureUsableGlossary(mapping);
+      glossaryId = glossaryVersion.deepl_glossary_id ?? undefined;
+      glossaryVersionId = glossaryVersion.glossary_version_id;
+    } catch (error) {
+      if (isAppError(error) && GLOSSARY_UNAVAILABLE_CODES.has(error.code)) {
+        this.logger.info(
+          {
+            event: "glossary_unavailable_translating_without",
+            mapping_id: mapping.mapping_id,
+            raw_message_id: payload.raw_message.message_id,
+            error_code: error.code,
+          },
+          "Glossary not available; translating without glossary",
+        );
+      } else {
+        throw error;
+      }
+    }
+
     const plans = this.segmenter.buildPlans({
       textBlocks: payload.text_blocks,
       sourceLang: mapping.source_lang,
       targetLang: mapping.target_lang,
-      glossaryId: glossaryVersion.deepl_glossary_id!,
-      glossaryVersionId: glossaryVersion.glossary_version_id,
+      glossaryId,
+      glossaryVersionId,
       context: this.buildTranslationContext(payload),
     });
 
     if (plans.length === 0) {
       return {
         translatedBlocks: new Map(),
-        usedGlossaryId: glossaryVersion.deepl_glossary_id!,
-        usedGlossaryVersionId: glossaryVersion.glossary_version_id,
+        usedGlossaryId: glossaryId ?? null,
+        usedGlossaryVersionId: glossaryVersionId ?? null,
         billedCharacters: 0,
         detectedSourceLanguage: null,
       };
@@ -221,8 +250,8 @@ export class TranslationOrchestrator {
 
     return {
       translatedBlocks,
-      usedGlossaryId: glossaryVersion.deepl_glossary_id!,
-      usedGlossaryVersionId: glossaryVersion.glossary_version_id,
+      usedGlossaryId: glossaryId ?? null,
+      usedGlossaryVersionId: glossaryVersionId ?? null,
       billedCharacters,
       detectedSourceLanguage,
     };

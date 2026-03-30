@@ -345,14 +345,14 @@ export interface TranslationRequestPlan {
   context: string;
   sourceLang: string;
   targetLang: string;
-  glossaryId: string;
-  glossaryVersionId: string;
+  glossaryId?: string;
+  glossaryVersionId?: string;
 }
 
 export interface TranslationResult {
   translatedBlocks: Map<string, string>;
-  usedGlossaryId: string;
-  usedGlossaryVersionId: string;
+  usedGlossaryId: string | null;
+  usedGlossaryVersionId: string | null;
   billedCharacters: number;
   detectedSourceLanguage: string | null;
 }

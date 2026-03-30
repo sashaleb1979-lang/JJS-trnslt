@@ -1,6 +1,16 @@
 import { AppError } from "../domain/errors";
 import { AppConfig, DeepLSupportedGlossaryPair, DeepLTranslateResponse, TranslationRequestPlan } from "../domain/types";
 
+interface DeepLTranslateRequest {
+  text: string[];
+  source_lang: string;
+  target_lang: string;
+  context: string;
+  model_type: string;
+  show_billed_characters: boolean;
+  glossary_id?: string;
+}
+
 export class DeepLClient {
   constructor(private readonly config: AppConfig) {}
 
@@ -39,15 +49,18 @@ export class DeepLClient {
       };
     }
 
-    const payload = {
+    const payload: DeepLTranslateRequest = {
       text: plan.items.map((item) => item.text),
       source_lang: plan.sourceLang,
       target_lang: plan.targetLang,
-      glossary_id: plan.glossaryId,
       context: plan.context,
       model_type: "quality_optimized",
       show_billed_characters: true,
     };
+
+    if (plan.glossaryId) {
+      payload.glossary_id = plan.glossaryId;
+    }
 
     const response = await this.request("/v2/translate", {
       method: "POST",
