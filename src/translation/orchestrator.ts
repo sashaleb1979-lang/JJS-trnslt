@@ -78,6 +78,28 @@ export class TranslationOrchestrator {
       this.metrics.increment("translationSuccessTotal");
       this.metrics.addBilledCharacters(billedCharacters);
       this.metrics.setLastSuccessfulTranslationAt(nowIso());
+    } else {
+      // No meaningful text blocks – translation skipped. Log this prominently for
+      // forwarded messages so operators can trace extraction failures.
+      const isForwarded = payload.origin_reference.reference_type === "forwarded" ||
+        payload.origin_reference.reference_type === "follow_crosspost";
+      const skipLogData = {
+        event: "translation_skipped_no_meaningful_text",
+        raw_message_id: payload.raw_message.message_id,
+        mapping_id: payload.mapping_id,
+        is_forwarded: isForwarded,
+        text_block_count: payload.text_blocks.length,
+        extracted_text_source: payload.content_text_source,
+      };
+      const skipMessage =
+        isForwarded ?
+          "Translation skipped — forwarded message has no meaningful text blocks; check extracted_text_source"
+        : "Translation skipped — no meaningful text blocks found";
+      if (isForwarded) {
+        this.logger.warn(skipLogData, skipMessage);
+      } else {
+        this.logger.info(skipLogData, skipMessage);
+      }
     }
 
     const plan = this.renderer.buildPlan({
@@ -111,8 +133,23 @@ export class TranslationOrchestrator {
     }
 
     const payload = JSON.parse(rawRecord.canonical_payload_json) as PostPayload;
+    // Use source_text as "translation" so the renderer can display the original content.
     const translatedBlocks = new Map<string, string>(payload.text_blocks.map((block) => [block.block_id, block.source_text]));
     const media = await this.attachmentHandler.prepare(payload.attachments, mapping.media_mode);
+
+    this.logger.warn(
+      {
+        event: "fallback_original_publish",
+        raw_message_id: payload.raw_message.message_id,
+        mapping_id: payload.mapping_id,
+        fallback_reason: reason,
+        text_block_count: payload.text_blocks.length,
+        extracted_text_source: payload.content_text_source,
+        reference_type: payload.origin_reference.reference_type,
+      },
+      "Publishing original (untranslated) content as fallback after translation failure",
+    );
+
     const plan = this.renderer.buildPlan({
       payload,
       mapping,

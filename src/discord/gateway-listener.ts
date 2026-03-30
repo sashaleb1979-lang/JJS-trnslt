@@ -78,24 +78,32 @@ export class GatewayListener {
 
     // Log diagnostic information about the canonicalized message so operators can
     // trace where the text and source label came from.
+    const isNativeForward = payload.origin_reference.reference_type === "forwarded";
+    const snapshotUsed = isNativeForward && payload.content_text_source === "snapshot";
+    const totalCharactersExtracted = payload.text_blocks.reduce((sum, block) => sum + block.source_text.length, 0);
     this.logger.info(
       {
         event: "message_canonicalized",
         raw_message_id: payload.raw_message.message_id,
         accept_reason: decision.reason,
+        accepted_as_forwarded: decision.reason === "forwarded_or_shared",
         follow_confidence: decision.confidence,
         reference_type: payload.origin_reference.reference_type,
-        is_native_forward: payload.origin_reference.reference_type === "forwarded",
-        content_text_source: payload.content_text_source,
+        is_native_forward: isNativeForward,
+        snapshot_used: snapshotUsed,
+        extracted_text_source: payload.content_text_source,
+        source_label_source: payload.detected_source_label_origin,
         content_is_empty: payload.content.is_empty,
-        text_blocks_count: payload.text_blocks.length,
+        text_block_count: payload.text_blocks.length,
+        total_characters_extracted: totalCharactersExtracted,
         detected_source_label: payload.detected_source_label,
-        detected_source_label_origin: payload.detected_source_label_origin,
         origin_channel_id: payload.origin_reference.origin_channel_id,
         origin_jump_url: payload.origin_reference.origin_jump_url,
       },
       payload.content.is_empty ?
         "Message canonicalized with empty content — no translatable text blocks found"
+      : isNativeForward && !snapshotUsed ?
+        "Message canonicalized as native forward but snapshot content was not used — check extracted_text_source"
       : "Message canonicalized",
     );
     const stableDuplicate =

@@ -18,6 +18,12 @@ export class MessageCanonicalizer {
     const isNativeForward = hasMessageSnapshots(message);
     const snapshot: MessageSnapshot | undefined = isNativeForward ? getFirstSnapshot(message) : undefined;
 
+    // Guard: hasMessageSnapshots() said there is a snapshot, but getFirstSnapshot()
+    // returned undefined. This can happen when discord.js fails to build the snapshot
+    // Collection (e.g. message_reference is absent in the gateway payload even though
+    // message_snapshots is present). Fall back gracefully to outer message content.
+    const snapshotRetrieved = isNativeForward && snapshot !== undefined;
+
     // "Effective" content: snapshot text takes priority for native forwards.
     // The outer message.content may carry an optional forwarder comment which
     // we append as a secondary block below.
@@ -26,11 +32,19 @@ export class MessageCanonicalizer {
 
     // Primary text for the `content` field is the snapshot body (if native
     // forward) or the regular outer content.
-    const primaryContentText = isNativeForward ? snapshotText : outerContentText;
+    // NOTE: When snapshotRetrieved is true but snapshotText is empty (embed-only
+    // original message), primaryContentText is intentionally left as "" — the embeds
+    // carry the actual content and the forwarder's outer comment (if any) is appended
+    // as a separate "forwarder_comment" block below.  Falling back to outerContentText
+    // here would duplicate it since forwarderComment already includes outerContentText.
+    // When snapshotRetrieved is false (snapshot expected but missing), we fall back to
+    // outerContentText as a best-effort so the message body is not silently dropped.
+    const primaryContentText = snapshotRetrieved ? snapshotText : outerContentText;
 
     // Effective embeds: use snapshot embeds for native forwards; fall back to
     // the message's own embeds for crosspost / follow / shared messages.
-    const effectiveEmbeds = isNativeForward && snapshot ? snapshot.embeds : message.embeds;
+    // If the snapshot was expected but not retrieved, also fall back to message embeds.
+    const effectiveEmbeds = snapshotRetrieved && snapshot ? snapshot.embeds : message.embeds;
 
     const embeds = effectiveEmbeds.map((embed, index) => ({
       embed_index: index,
@@ -49,7 +63,7 @@ export class MessageCanonicalizer {
     }));
 
     // Effective attachments: snapshot attachments for native forwards, else message attachments.
-    const effectiveAttachmentCollection = isNativeForward && snapshot ? snapshot.attachments : message.attachments;
+    const effectiveAttachmentCollection = snapshotRetrieved && snapshot ? snapshot.attachments : message.attachments;
     const attachments = effectiveAttachmentCollection.map((attachment) => ({
       attachment_id: attachment.id,
       filename: attachment.name ?? attachment.id,
@@ -67,6 +81,8 @@ export class MessageCanonicalizer {
     // ------------------------------------------------------------------ //
     // Source label: for native forwards we try to resolve the origin      //
     // channel name rather than using the forwarder's username.            //
+    // For cross-guild forwards the channel won't be in our guild cache,   //
+    // so we also pass the origin guild name as a secondary attribution.   //
     // ------------------------------------------------------------------ //
     const originChannelId = message.reference?.channelId ?? null;
     const originChannelRaw = originChannelId ? message.guild?.channels.cache.get(originChannelId) : undefined;
@@ -87,17 +103,27 @@ export class MessageCanonicalizer {
       embedFooterText: embeds[0]?.footer_text ?? null,
       isForwardedMessage: isNativeForward,
       originChannelName,
+      // originGuildName is not available from the gateway payload for cross-guild
+      // forwards; embed author/footer metadata is used as fallback instead.
+      originGuildName: null,
     });
 
     // ------------------------------------------------------------------ //
     // Text blocks and content diagnostics                                 //
     // ------------------------------------------------------------------ //
-    const textBlocks = this.extractTextBlocks(primaryContentText, embeds, isNativeForward ? outerContentText : null);
+    // For native forwards, the forwarder comment is the outer content; it is only
+    // added as a secondary block if it's non-empty (forwarder added their own note).
+    const forwarderComment = snapshotRetrieved && outerContentText ? outerContentText : null;
+    const textBlocks = this.extractTextBlocks(primaryContentText, embeds, forwarderComment);
 
     // Determine the diagnostic content_text_source for logging.
     let contentTextSource: PostPayload["content_text_source"];
     if (isNativeForward) {
-      if (snapshotText) {
+      if (!snapshotRetrieved) {
+        // Snapshot was expected (hasMessageSnapshots=true) but could not be built.
+        // We fell back to outer message content or embeds.
+        contentTextSource = outerContentText ? "message_content" : embeds.length > 0 ? "embeds_only" : "empty";
+      } else if (snapshotText) {
         contentTextSource = "snapshot";
       } else if (embeds.length > 0) {
         contentTextSource = "embeds_only";
@@ -159,7 +185,7 @@ export class MessageCanonicalizer {
         follow_confidence: followConfidence,
       },
       content: {
-        raw_text: isNativeForward ? (snapshot?.content ?? "") : (message.content ?? ""),
+        raw_text: snapshotRetrieved ? (snapshot?.content ?? "") : (message.content ?? ""),
         normalized_text: primaryContentText,
         is_empty: !primaryContentText,
       },
