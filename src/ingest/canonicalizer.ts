@@ -4,6 +4,7 @@ import { nowIso } from "../utils/time";
 import { extractUrls, normalizeWhitespace } from "../utils/text";
 import { buildContentChecksum, buildDedupeKey } from "./checksum";
 import { detectSourceLabel } from "./source-label";
+import { hasMessageSnapshots } from "./message-filter";
 
 export class MessageCanonicalizer {
   canonicalize(message: Message, mapping: ChannelMappingRow, followConfidence: "high" | "medium" | "low"): PostPayload {
@@ -75,7 +76,7 @@ export class MessageCanonicalizer {
         origin_channel_id: message.reference?.channelId ?? null,
         origin_message_id: message.reference?.messageId ?? null,
         origin_jump_url: null,
-        reference_type: message.reference ? "follow_crosspost" : null,
+        reference_type: hasMessageSnapshots(message) ? "forwarded" : message.reference ? "follow_crosspost" : null,
       },
       source_markers: {
         has_webhook_id: Boolean(message.webhookId),
