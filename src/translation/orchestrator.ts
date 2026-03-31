@@ -14,7 +14,12 @@ import { MetricsService } from "../monitoring/metrics";
 import { AttachmentHandler } from "../publish/attachment-handler";
 import { DiscordPublisher } from "../publish/discord-publisher";
 import { PublishRenderer } from "../publish/renderer";
-import { hasMeaningfulText, hashSafeSummary, isSuspiciousUntranslatedText } from "../utils/text";
+import {
+  hasMeaningfulText,
+  hashSafeSummary,
+  isSuspiciousAggregateUntranslatedText,
+  isSuspiciousUntranslatedText,
+} from "../utils/text";
 import { nowIso } from "../utils/time";
 import { createId } from "../utils/ids";
 import { DeepLClient } from "./deepl-client";
@@ -95,6 +100,20 @@ export class TranslationOrchestrator {
       this.metrics.increment("translationSuccessTotal");
       this.metrics.addBilledCharacters(billedCharacters);
       this.metrics.setLastSuccessfulTranslationAt(nowIso());
+
+      this.logger.info(
+        {
+          event: "translation_status_resolved",
+          raw_message_id: payload.raw_message.message_id,
+          mapping_id: payload.mapping_id,
+          translation_status: translationStatus,
+          meaningful_block_count: meaningfulText.length,
+          validation_fallback_block_count: translationResult.validationFallbackBlockCount,
+          untranslated_meaningful_block_count: translationResult.untranslatedMeaningfulBlockCount,
+          aggregate_untranslated: translationResult.aggregateUntranslated,
+        },
+        `Translation status resolved: ${translationStatus} (meaningful=${meaningfulText.length}, validation_fallback=${translationResult.validationFallbackBlockCount}, suspicious_blocks=${translationResult.untranslatedMeaningfulBlockCount}, aggregate_untranslated=${translationResult.aggregateUntranslated})`,
+      );
 
       if (translationStatus !== "translated") {
         this.logger.warn(
@@ -236,8 +255,9 @@ export class TranslationOrchestrator {
           target_lang: mapping.target_lang,
           untranslated_meaningful_block_count: initialResult.untranslatedMeaningfulBlockCount,
           meaningful_block_count: meaningfulBlockCount,
+          aggregate_untranslated: initialResult.aggregateUntranslated,
         },
-        "DeepL returned untranslated content; retrying without glossary and with source language autodetect",
+        `DeepL returned untranslated content; retrying without glossary and with source language autodetect (source=${mapping.source_lang}, target=${mapping.target_lang}, suspicious_blocks=${initialResult.untranslatedMeaningfulBlockCount}, aggregate_untranslated=${initialResult.aggregateUntranslated})`,
       );
 
       const retryResult = await this.executeTranslation(payload, mapping, undefined, undefined, undefined);
@@ -265,6 +285,7 @@ export class TranslationOrchestrator {
         detectedSourceLanguage: retryResult.detectedSourceLanguage ?? initialResult.detectedSourceLanguage,
         validationFallbackBlockCount: meaningfulBlockCount,
         untranslatedMeaningfulBlockCount: meaningfulBlockCount,
+        aggregateUntranslated: true,
       };
     } catch (error) {
       if (glossaryId && isGlossaryTranslationFailure(error)) {
@@ -311,6 +332,7 @@ export class TranslationOrchestrator {
         detectedSourceLanguage: null,
         validationFallbackBlockCount: 0,
         untranslatedMeaningfulBlockCount: 0,
+        aggregateUntranslated: false,
       };
     }
 
@@ -326,8 +348,11 @@ export class TranslationOrchestrator {
           mapping_id: payload.mapping_id,
           raw_message_id: payload.raw_message.message_id,
           batch_items: plan.items.length,
+          source_lang: plan.sourceLang ?? "auto",
+          target_lang: plan.targetLang,
+          glossary_id: plan.glossaryId ?? null,
         },
-        "Starting DeepL translation batch",
+        `Starting DeepL translation batch (items=${plan.items.length}, source=${plan.sourceLang ?? "auto"}, target=${plan.targetLang}, glossary=${plan.glossaryId ? "yes" : "no"})`,
       );
 
       const response = await this.deepl.translate(plan);
@@ -351,9 +376,11 @@ export class TranslationOrchestrator {
       });
     }
 
-    const untranslatedMeaningfulBlockCount = payload.text_blocks
+    const meaningfulBlocks = payload.text_blocks
       .filter((block) => hasMeaningfulText(block.source_text))
-      .filter((block) => !validationFallbackBlocks.has(block.block_id))
+      .filter((block) => !validationFallbackBlocks.has(block.block_id));
+
+    const untranslatedMeaningfulBlockCount = meaningfulBlocks
       .filter((block) => {
         const translated = translatedBlocks.get(block.block_id);
         if (!translated) {
@@ -368,7 +395,13 @@ export class TranslationOrchestrator {
       })
       .length;
 
-    if (untranslatedMeaningfulBlockCount > 0) {
+    const aggregateUntranslated = meaningfulBlocks.length > 0 && isSuspiciousAggregateUntranslatedText({
+      originalTexts: meaningfulBlocks.map((block) => block.source_text),
+      translatedTexts: meaningfulBlocks.map((block) => translatedBlocks.get(block.block_id) ?? "").filter(Boolean),
+      targetLang: mapping.target_lang,
+    });
+
+    if (untranslatedMeaningfulBlockCount > 0 || aggregateUntranslated) {
       this.logger.warn(
         {
           event: "translation_noop_blocks_detected",
@@ -378,8 +411,11 @@ export class TranslationOrchestrator {
           source_lang: sourceLang ?? "auto",
           target_lang: mapping.target_lang,
           untranslated_meaningful_block_count: untranslatedMeaningfulBlockCount,
+          aggregate_untranslated: aggregateUntranslated,
+          original_preview: hashSafeSummary(meaningfulBlocks.map((block) => block.source_text).join("\n\n"), 220),
+          translated_preview: hashSafeSummary(meaningfulBlocks.map((block) => translatedBlocks.get(block.block_id) ?? "").join("\n\n"), 220),
         },
-        "Some translated blocks are effectively unchanged after DeepL response",
+        `Some translated blocks are effectively unchanged after DeepL response (aggregate_untranslated=${aggregateUntranslated}, suspicious_blocks=${untranslatedMeaningfulBlockCount})`,
       );
     }
 
@@ -391,11 +427,12 @@ export class TranslationOrchestrator {
       detectedSourceLanguage,
       validationFallbackBlockCount: validationFallbackBlocks.size,
       untranslatedMeaningfulBlockCount,
+      aggregateUntranslated,
     };
   }
 
   private shouldRetrySuspiciousNoop(result: TranslationResult, meaningfulBlockCount: number): boolean {
-    return meaningfulBlockCount > 0 && result.untranslatedMeaningfulBlockCount >= meaningfulBlockCount;
+    return meaningfulBlockCount > 0 && (result.aggregateUntranslated || result.untranslatedMeaningfulBlockCount >= meaningfulBlockCount);
   }
 
   private validateTranslatedBlock(

@@ -40,10 +40,6 @@ export function isSuspiciousUntranslatedText(input: {
 }): boolean {
   const originalNormalized = normalizeForTranslationComparison(input.originalText);
   const translatedNormalized = normalizeForTranslationComparison(input.translatedText);
-  if (!originalNormalized || originalNormalized !== translatedNormalized) {
-    return false;
-  }
-
   const latinWordCount = input.originalText.match(LATIN_WORD_REGEX)?.length ?? 0;
   if (latinWordCount < 2 || originalNormalized.length < 12) {
     return false;
@@ -58,7 +54,30 @@ export function isSuspiciousUntranslatedText(input: {
     return false;
   }
 
-  return !CYRILLIC_REGEX.test(input.translatedText);
+  if (CYRILLIC_REGEX.test(input.translatedText)) {
+    return false;
+  }
+
+  if (originalNormalized === translatedNormalized) {
+    return true;
+  }
+
+  return hasHighLatinWordOverlap(input.originalText, input.translatedText);
+}
+
+export function isSuspiciousAggregateUntranslatedText(input: {
+  originalTexts: string[];
+  translatedTexts: string[];
+  targetLang: string;
+}): boolean {
+  const originalCombined = input.originalTexts.map((value) => value.trim()).filter(Boolean).join("\n");
+  const translatedCombined = input.translatedTexts.map((value) => value.trim()).filter(Boolean).join("\n");
+
+  return isSuspiciousUntranslatedText({
+    originalText: originalCombined,
+    translatedText: translatedCombined,
+    targetLang: input.targetLang,
+  });
 }
 
 function normalizeForTranslationComparison(value: string): string {
@@ -68,6 +87,32 @@ function normalizeForTranslationComparison(value: string): string {
     .replace(COMPARISON_NOISE_REGEX, "")
     .toLowerCase()
     .trim();
+}
+
+function hasHighLatinWordOverlap(originalText: string, translatedText: string): boolean {
+  const originalWords = extractLatinWords(originalText);
+  const translatedWords = extractLatinWords(translatedText);
+
+  if (originalWords.length < 2 || translatedWords.length < 2) {
+    return false;
+  }
+
+  const originalSet = new Set(originalWords);
+  const translatedSet = new Set(translatedWords);
+  let sharedCount = 0;
+
+  for (const word of translatedSet) {
+    if (originalSet.has(word)) {
+      sharedCount += 1;
+    }
+  }
+
+  const denominator = Math.max(originalSet.size, translatedSet.size);
+  return denominator > 0 && sharedCount / denominator >= 0.8;
+}
+
+function extractLatinWords(value: string): string[] {
+  return Array.from(value.matchAll(LATIN_WORD_REGEX), (match) => match[0].toLowerCase());
 }
 
 export function chunkText(input: string, maxLength: number): string[] {

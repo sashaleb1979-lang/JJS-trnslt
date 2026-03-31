@@ -357,6 +357,7 @@ export interface TranslationResult {
   detectedSourceLanguage: string | null;
   validationFallbackBlockCount: number;
   untranslatedMeaningfulBlockCount: number;
+  aggregateUntranslated: boolean;
 }
 
 export type TranslationPublicationStatus = "translated" | "skipped" | "partial_original" | "fallback_original";
