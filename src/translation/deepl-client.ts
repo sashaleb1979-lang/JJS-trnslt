@@ -3,7 +3,7 @@ import { AppConfig, DeepLSupportedGlossaryPair, DeepLTranslateResponse, Translat
 
 interface DeepLTranslateRequest {
   text: string[];
-  source_lang: string;
+  source_lang?: string;
   target_lang: string;
   context: string;
   model_type: string;
@@ -52,12 +52,15 @@ export class DeepLClient {
 
     const payload: DeepLTranslateRequest = {
       text: plan.items.map((item) => item.text),
-      source_lang: plan.sourceLang,
       target_lang: plan.targetLang,
       context: plan.context,
       model_type: "quality_optimized",
       show_billed_characters: true,
     };
+
+    if (plan.sourceLang) {
+      payload.source_lang = plan.sourceLang;
+    }
 
     if (plan.glossaryId) {
       payload.glossary_id = plan.glossaryId;

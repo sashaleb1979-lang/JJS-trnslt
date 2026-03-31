@@ -343,7 +343,7 @@ export interface TranslationBatchItem {
 export interface TranslationRequestPlan {
   items: TranslationBatchItem[];
   context: string;
-  sourceLang: string;
+  sourceLang?: string;
   targetLang: string;
   glossaryId?: string;
   glossaryVersionId?: string;
@@ -356,6 +356,7 @@ export interface TranslationResult {
   billedCharacters: number;
   detectedSourceLanguage: string | null;
   validationFallbackBlockCount: number;
+  untranslatedMeaningfulBlockCount: number;
 }
 
 export type TranslationPublicationStatus = "translated" | "skipped" | "partial_original" | "fallback_original";

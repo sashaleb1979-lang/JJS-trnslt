@@ -1,6 +1,11 @@
 const URL_REGEX = /\bhttps?:\/\/[^\s<>()]+/gi;
 const DIGIT_REGEX = /\d+/g;
 const LETTER_REGEX = /\p{L}/u;
+const LATIN_WORD_REGEX = /\b\p{Script=Latin}{2,}\b/gu;
+const LATIN_REGEX = /\p{Script=Latin}/u;
+const CYRILLIC_REGEX = /\p{Script=Cyrillic}/u;
+const COMPARISON_NOISE_REGEX = /[\s\p{P}\p{S}]+/gu;
+const CYRILLIC_TARGET_LANGS = new Set(["RU", "UK", "BG", "SR"]);
 
 export function normalizeWhitespace(value: string): string {
   return value.replace(/\r\n/g, "\n").replace(/[ \t]+\n/g, "\n").trim();
@@ -26,6 +31,43 @@ export function hasMeaningfulText(value: string): boolean {
 
 export function countNumericTokens(value: string): number {
   return (value.match(DIGIT_REGEX) ?? []).length;
+}
+
+export function isSuspiciousUntranslatedText(input: {
+  originalText: string;
+  translatedText: string;
+  targetLang: string;
+}): boolean {
+  const originalNormalized = normalizeForTranslationComparison(input.originalText);
+  const translatedNormalized = normalizeForTranslationComparison(input.translatedText);
+  if (!originalNormalized || originalNormalized !== translatedNormalized) {
+    return false;
+  }
+
+  const latinWordCount = input.originalText.match(LATIN_WORD_REGEX)?.length ?? 0;
+  if (latinWordCount < 2 || originalNormalized.length < 12) {
+    return false;
+  }
+
+  if (!LATIN_REGEX.test(input.originalText)) {
+    return false;
+  }
+
+  const targetLang = input.targetLang.toUpperCase();
+  if (!CYRILLIC_TARGET_LANGS.has(targetLang)) {
+    return false;
+  }
+
+  return !CYRILLIC_REGEX.test(input.translatedText);
+}
+
+function normalizeForTranslationComparison(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(URL_REGEX, "")
+    .replace(COMPARISON_NOISE_REGEX, "")
+    .toLowerCase()
+    .trim();
 }
 
 export function chunkText(input: string, maxLength: number): string[] {

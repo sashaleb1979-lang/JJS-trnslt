@@ -14,7 +14,7 @@ import { MetricsService } from "../monitoring/metrics";
 import { AttachmentHandler } from "../publish/attachment-handler";
 import { DiscordPublisher } from "../publish/discord-publisher";
 import { PublishRenderer } from "../publish/renderer";
-import { hasMeaningfulText, hashSafeSummary } from "../utils/text";
+import { hasMeaningfulText, hashSafeSummary, isSuspiciousUntranslatedText } from "../utils/text";
 import { nowIso } from "../utils/time";
 import { createId } from "../utils/ids";
 import { DeepLClient } from "./deepl-client";
@@ -193,6 +193,7 @@ export class TranslationOrchestrator {
   }
 
   private async translatePayload(payload: PostPayload, mapping: ChannelMappingRow): Promise<TranslationResult> {
+    const meaningfulBlockCount = payload.text_blocks.filter((block) => hasMeaningfulText(block.source_text)).length;
     // Glossary is optional — attempt to get one but fall back to glossary-free
     // translation if none is configured or not yet ready. This ensures messages
     // are always translated rather than blocked by a missing glossary.
@@ -220,7 +221,51 @@ export class TranslationOrchestrator {
     }
 
     try {
-      return await this.executeTranslation(payload, mapping, glossaryId, glossaryVersionId);
+      const initialResult = await this.executeTranslation(payload, mapping, glossaryId, glossaryVersionId, mapping.source_lang);
+      if (!this.shouldRetrySuspiciousNoop(initialResult, meaningfulBlockCount)) {
+        return initialResult;
+      }
+
+      this.logger.warn(
+        {
+          event: "translation_noop_detected_retrying_autodetect",
+          mapping_id: mapping.mapping_id,
+          raw_message_id: payload.raw_message.message_id,
+          glossary_id: glossaryId ?? null,
+          source_lang: mapping.source_lang,
+          target_lang: mapping.target_lang,
+          untranslated_meaningful_block_count: initialResult.untranslatedMeaningfulBlockCount,
+          meaningful_block_count: meaningfulBlockCount,
+        },
+        "DeepL returned untranslated content; retrying without glossary and with source language autodetect",
+      );
+
+      const retryResult = await this.executeTranslation(payload, mapping, undefined, undefined, undefined);
+      if (!this.shouldRetrySuspiciousNoop(retryResult, meaningfulBlockCount)) {
+        return retryResult;
+      }
+
+      this.logger.error(
+        {
+          event: "translation_noop_detected_publishing_original",
+          mapping_id: mapping.mapping_id,
+          raw_message_id: payload.raw_message.message_id,
+          source_lang: mapping.source_lang,
+          target_lang: mapping.target_lang,
+          meaningful_block_count: meaningfulBlockCount,
+        },
+        "DeepL returned effectively untranslated content even after retry; publishing original with error footer",
+      );
+
+      return {
+        translatedBlocks: new Map(),
+        usedGlossaryId: null,
+        usedGlossaryVersionId: null,
+        billedCharacters: initialResult.billedCharacters + retryResult.billedCharacters,
+        detectedSourceLanguage: retryResult.detectedSourceLanguage ?? initialResult.detectedSourceLanguage,
+        validationFallbackBlockCount: meaningfulBlockCount,
+        untranslatedMeaningfulBlockCount: meaningfulBlockCount,
+      };
     } catch (error) {
       if (glossaryId && isGlossaryTranslationFailure(error)) {
         this.logger.warn(
@@ -235,7 +280,7 @@ export class TranslationOrchestrator {
           },
           "Translation failed because glossary is unavailable; retrying without glossary",
         );
-        return await this.executeTranslation(payload, mapping, undefined, undefined);
+        return await this.executeTranslation(payload, mapping, undefined, undefined, mapping.source_lang);
       }
       throw error;
     }
@@ -246,10 +291,11 @@ export class TranslationOrchestrator {
     mapping: ChannelMappingRow,
     glossaryId: string | undefined,
     glossaryVersionId: string | undefined,
+    sourceLang: string | undefined,
   ): Promise<TranslationResult> {
     const plans = this.segmenter.buildPlans({
       textBlocks: payload.text_blocks,
-      sourceLang: mapping.source_lang,
+      sourceLang,
       targetLang: mapping.target_lang,
       glossaryId,
       glossaryVersionId,
@@ -264,6 +310,7 @@ export class TranslationOrchestrator {
         billedCharacters: 0,
         detectedSourceLanguage: null,
         validationFallbackBlockCount: 0,
+        untranslatedMeaningfulBlockCount: 0,
       };
     }
 
@@ -304,6 +351,38 @@ export class TranslationOrchestrator {
       });
     }
 
+    const untranslatedMeaningfulBlockCount = payload.text_blocks
+      .filter((block) => hasMeaningfulText(block.source_text))
+      .filter((block) => !validationFallbackBlocks.has(block.block_id))
+      .filter((block) => {
+        const translated = translatedBlocks.get(block.block_id);
+        if (!translated) {
+          return false;
+        }
+
+        return isSuspiciousUntranslatedText({
+          originalText: block.source_text,
+          translatedText: translated,
+          targetLang: mapping.target_lang,
+        });
+      })
+      .length;
+
+    if (untranslatedMeaningfulBlockCount > 0) {
+      this.logger.warn(
+        {
+          event: "translation_noop_blocks_detected",
+          mapping_id: mapping.mapping_id,
+          raw_message_id: payload.raw_message.message_id,
+          glossary_id: glossaryId ?? null,
+          source_lang: sourceLang ?? "auto",
+          target_lang: mapping.target_lang,
+          untranslated_meaningful_block_count: untranslatedMeaningfulBlockCount,
+        },
+        "Some translated blocks are effectively unchanged after DeepL response",
+      );
+    }
+
     return {
       translatedBlocks,
       usedGlossaryId: glossaryId ?? null,
@@ -311,7 +390,12 @@ export class TranslationOrchestrator {
       billedCharacters,
       detectedSourceLanguage,
       validationFallbackBlockCount: validationFallbackBlocks.size,
+      untranslatedMeaningfulBlockCount,
     };
+  }
+
+  private shouldRetrySuspiciousNoop(result: TranslationResult, meaningfulBlockCount: number): boolean {
+    return meaningfulBlockCount > 0 && result.untranslatedMeaningfulBlockCount >= meaningfulBlockCount;
   }
 
   private validateTranslatedBlock(

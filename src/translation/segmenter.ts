@@ -9,7 +9,7 @@ const MAX_SEGMENT_LENGTH = 1_500;
 export class TranslationSegmenter {
   buildPlans(input: {
     textBlocks: CanonicalTextBlock[];
-    sourceLang: string;
+    sourceLang?: string;
     targetLang: string;
     glossaryId?: string;
     glossaryVersionId?: string;
