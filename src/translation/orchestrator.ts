@@ -1,6 +1,15 @@
 import { Logger } from "pino";
 import { AppError, isAppError } from "../domain/errors";
-import { AppConfig, AppRepositories, ChannelMappingRow, PostPayload, PublishPlan, TranslationJobRow, TranslationResult } from "../domain/types";
+import {
+  AppConfig,
+  AppRepositories,
+  ChannelMappingRow,
+  PostPayload,
+  PublishPlan,
+  TranslationJobRow,
+  TranslationPublicationStatus,
+  TranslationResult,
+} from "../domain/types";
 import { MetricsService } from "../monitoring/metrics";
 import { AttachmentHandler } from "../publish/attachment-handler";
 import { DiscordPublisher } from "../publish/discord-publisher";
@@ -76,14 +85,30 @@ export class TranslationOrchestrator {
 
     let translatedBlocks = new Map<string, string>();
     let billedCharacters = 0;
+    let translationStatus: TranslationPublicationStatus = "skipped";
 
     if (meaningfulText.length > 0) {
       const translationResult = await this.translatePayload(payload, mapping);
       translatedBlocks = translationResult.translatedBlocks;
       billedCharacters = translationResult.billedCharacters;
+      translationStatus = this.resolvePublicationStatus(meaningfulText.length, translationResult.validationFallbackBlockCount);
       this.metrics.increment("translationSuccessTotal");
       this.metrics.addBilledCharacters(billedCharacters);
       this.metrics.setLastSuccessfulTranslationAt(nowIso());
+
+      if (translationStatus !== "translated") {
+        this.logger.warn(
+          {
+            event: "translation_not_fully_restored",
+            raw_message_id: payload.raw_message.message_id,
+            mapping_id: payload.mapping_id,
+            translation_status: translationStatus,
+            meaningful_block_count: meaningfulText.length,
+            validation_fallback_block_count: translationResult.validationFallbackBlockCount,
+          },
+          "Translation completed with original text still present in published output",
+        );
+      }
     } else {
       // No meaningful text blocks – translation skipped. Log this prominently for
       // forwarded messages so operators can trace extraction failures.
@@ -113,7 +138,7 @@ export class TranslationOrchestrator {
       mapping,
       translatedBlocks,
       media,
-      fallbackOriginal: false,
+      translationStatus,
     });
 
     return this.publishAndPersist(job, mapping, payload, plan, billedCharacters);
@@ -161,7 +186,7 @@ export class TranslationOrchestrator {
       mapping,
       translatedBlocks,
       media,
-      fallbackOriginal: true,
+      translationStatus: "fallback_original",
     });
 
     return this.publishAndPersist(job, mapping, payload, plan, 0, `Fallback publish after translation failure: ${reason}`);
@@ -238,12 +263,14 @@ export class TranslationOrchestrator {
         usedGlossaryVersionId: glossaryVersionId ?? null,
         billedCharacters: 0,
         detectedSourceLanguage: null,
+        validationFallbackBlockCount: 0,
       };
     }
 
     const translatedBlocks = new Map<string, string>();
     let billedCharacters = 0;
     let detectedSourceLanguage: string | null = null;
+    const validationFallbackBlocks = new Set<string>();
 
     for (const plan of plans) {
       this.logger.info(
@@ -268,7 +295,10 @@ export class TranslationOrchestrator {
       response.translations.forEach((translation, index) => {
         const item = plan.items[index];
         const restored = this.validateTranslatedBlock(item, translation.text, payload, mapping, glossaryId);
-        this.storeTranslatedBlock(translatedBlocks, item.blockId, restored);
+        if (restored.usedOriginalText) {
+          validationFallbackBlocks.add(this.resolveBaseBlockId(item.blockId));
+        }
+        this.storeTranslatedBlock(translatedBlocks, item.blockId, restored.text);
         billedCharacters += translation.billed_characters ?? item.originalText.length;
         detectedSourceLanguage = detectedSourceLanguage ?? translation.detected_source_language ?? null;
       });
@@ -280,6 +310,7 @@ export class TranslationOrchestrator {
       usedGlossaryVersionId: glossaryVersionId ?? null,
       billedCharacters,
       detectedSourceLanguage,
+      validationFallbackBlockCount: validationFallbackBlocks.size,
     };
   }
 
@@ -289,13 +320,16 @@ export class TranslationOrchestrator {
     payload: PostPayload,
     mapping: ChannelMappingRow,
     glossaryId: string | undefined,
-  ): string {
+  ): { text: string; usedOriginalText: boolean } {
     try {
-      return this.validator.validateAndRestore({
-        originalText: item.originalText,
-        translatedText,
-        tokenMap: item.tokenMap,
-      });
+      return {
+        text: this.validator.validateAndRestore({
+          originalText: item.originalText,
+          translatedText,
+          tokenMap: item.tokenMap,
+        }),
+        usedOriginalText: false,
+      };
     } catch (error) {
       if (isAppError(error) && BLOCK_VALIDATION_FALLBACK_CODES.has(error.code)) {
         this.logger.warn(
@@ -311,11 +345,38 @@ export class TranslationOrchestrator {
           },
           "Translation block failed validation; using original block text",
         );
-        return item.originalText;
+        return {
+          text: item.originalText,
+          usedOriginalText: true,
+        };
       }
 
       throw error;
     }
+  }
+
+  private resolvePublicationStatus(
+    meaningfulBlockCount: number,
+    validationFallbackBlockCount: number,
+  ): TranslationPublicationStatus {
+    if (meaningfulBlockCount === 0) {
+      return "skipped";
+    }
+
+    if (validationFallbackBlockCount === 0) {
+      return "translated";
+    }
+
+    if (validationFallbackBlockCount >= meaningfulBlockCount) {
+      return "fallback_original";
+    }
+
+    return "partial_original";
+  }
+
+  private resolveBaseBlockId(blockId: string): string {
+    const match = blockId.match(/^(.*):part:\d+$/);
+    return match?.[1] ?? blockId;
   }
 
   private async publishAndPersist(
@@ -363,8 +424,7 @@ export class TranslationOrchestrator {
   }
 
   private storeTranslatedBlock(map: Map<string, string>, blockId: string, translatedText: string): void {
-    const match = blockId.match(/^(.*):part:\d+$/);
-    const baseId = match?.[1] ?? blockId;
+    const baseId = this.resolveBaseBlockId(blockId);
     const existing = map.get(baseId);
     map.set(baseId, existing ? `${existing}\n\n${translatedText}` : translatedText);
   }

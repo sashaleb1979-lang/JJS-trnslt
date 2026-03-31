@@ -1,22 +1,19 @@
-import { ChannelMappingRow, PostPayload, PublishPlan } from "../domain/types";
+import { ChannelMappingRow, PostPayload, PublishPlan, TranslationPublicationStatus } from "../domain/types";
 import { sanitizeForDiscord } from "../utils/text";
 import { chunkForDiscordContent, fitEmbedDescription } from "./chunker";
 import { PreparedMedia } from "./attachment-handler";
 
 export class PublishRenderer {
-  // Renderer footer distinguishes translated, skipped, and fallback publication paths.
   buildPlan(input: {
     payload: PostPayload;
     mapping: ChannelMappingRow;
     translatedBlocks: Map<string, string>;
     media: PreparedMedia;
-    fallbackOriginal: boolean;
+    translationStatus: TranslationPublicationStatus;
   }): PublishPlan {
     const title = this.resolveTitle(input.payload, input.translatedBlocks);
     const body = this.resolveBody(input.payload, input.translatedBlocks);
-    const footer = `Источник: ${input.payload.detected_source_label} • ${
-      input.fallbackOriginal ? "Оригинал (ошибка перевода)" : "Автоперевод DeepL"
-    }`;
+    const footer = `Источник: ${input.payload.detected_source_label} • ${this.resolveFooterStatus(input.translationStatus)}`;
     const fileLinks = input.media.linkLines.length > 0 ? `\n\nВложения:\n${input.media.linkLines.join("\n")}` : "";
     const finalBody = sanitizeForDiscord(`${body}${fileLinks}`.trim());
 
@@ -137,5 +134,19 @@ export class PublishRenderer {
     }
 
     return sections.join("\n\n").trim();
+  }
+
+  private resolveFooterStatus(status: TranslationPublicationStatus): string {
+    switch (status) {
+      case "skipped":
+        return "Перевод не требуется";
+      case "partial_original":
+        return "Частично оригинал (ошибка перевода)";
+      case "fallback_original":
+        return "Оригинал (ошибка перевода)";
+      case "translated":
+      default:
+        return "Автоперевод DeepL";
+    }
   }
 }

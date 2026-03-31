@@ -355,7 +355,10 @@ export interface TranslationResult {
   usedGlossaryVersionId: string | null;
   billedCharacters: number;
   detectedSourceLanguage: string | null;
+  validationFallbackBlockCount: number;
 }
+
+export type TranslationPublicationStatus = "translated" | "skipped" | "partial_original" | "fallback_original";
 
 export interface DeepLTranslateResponse {
   translations: Array<{
