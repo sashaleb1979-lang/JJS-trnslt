@@ -42,6 +42,27 @@ export class FailedJobsRepository {
       .all(limit);
   }
 
+  markResolvedByRawMessageIds(rawMessageIds: string[], resolutionNote: string): void {
+    if (rawMessageIds.length === 0) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const update = this.db.transaction((ids: string[]) => {
+      const statement = this.db.prepare(
+        `UPDATE failed_jobs
+         SET resolved_at = ?, resolution_note = ?
+         WHERE raw_message_id = ? AND resolved_at IS NULL`,
+      );
+
+      for (const rawMessageId of ids) {
+        statement.run(now, resolutionNote, rawMessageId);
+      }
+    });
+
+    update(rawMessageIds);
+  }
+
   countAll(): number {
     const row = this.db.prepare<unknown[], { count: number }>("SELECT COUNT(*) AS count FROM failed_jobs").get();
     return row?.count ?? 0;

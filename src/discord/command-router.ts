@@ -1,20 +1,28 @@
 import {
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonInteraction,
+  ButtonStyle,
+  ChannelSelectMenuBuilder,
+  ChannelSelectMenuInteraction,
   ChannelType,
   ChatInputCommandInteraction,
   Client,
   GuildMember,
+  MessageComponentInteraction,
   ModalBuilder,
   ModalSubmitInteraction,
   PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
-  TextChannel,
+  StringSelectMenuBuilder,
+  StringSelectMenuInteraction,
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
 import { Logger } from "pino";
+import { MEDIA_MODE, MediaMode, RENDER_MODE, RenderMode } from "../domain/enums";
 import { AppConfig, AppRepositories, ChannelMappingRow } from "../domain/types";
 import { AppError } from "../domain/errors";
 import { StatusService } from "../monitoring/status-service";
@@ -22,9 +30,28 @@ import { GlossaryManager } from "../translation/glossary-manager";
 import { DeepLClient } from "../translation/deepl-client";
 import { parseBulkGlossaryPayload, formatParseErrors } from "../translation/glossary-bulk-importer";
 import { createId } from "../utils/ids";
-import { ensureTextChannel, validateSetupPermissions } from "./permission-guard";
+import { ensureTextChannel, SupportedSetupChannel, validateSetupPermissions } from "./permission-guard";
+
+type PanelView = "main" | "setup";
+
+interface PanelSession {
+  userId: string;
+  guildId: string;
+  selectedMappingId: string | null;
+  view: PanelView;
+  setupRawChannelId: string | null;
+  setupOutputChannelId: string | null;
+  setupLogChannelId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+const PANEL_PREFIX = "panel";
+const PANEL_SESSION_TTL_MS = 30 * 60 * 1000;
 
 export class CommandRouter {
+  private readonly panelSessions = new Map<string, PanelSession>();
+
   constructor(
     private readonly client: Client,
     private readonly repositories: AppRepositories,
@@ -66,6 +93,9 @@ export class CommandRouter {
       }
 
       switch (interaction.commandName) {
+        case "panel":
+          await this.handlePanel(interaction);
+          break;
         case "setup":
           await this.handleSetup(interaction, member);
           break;
@@ -102,6 +132,106 @@ export class CommandRouter {
       } else {
         await interaction.reply({ content: message, ephemeral: true });
       }
+    }
+  }
+
+  async handleComponentInteraction(
+    interaction: ButtonInteraction | ChannelSelectMenuInteraction | StringSelectMenuInteraction,
+  ): Promise<void> {
+    if (!interaction.inGuild() || !interaction.guild) {
+      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", ephemeral: true });
+      return;
+    }
+
+    const member = await interaction.guild.members.fetch(interaction.user.id);
+    if (!this.hasAdminAccess(member)) {
+      await interaction.reply({ content: "Недостаточно прав для использования этой команды.", ephemeral: true });
+      return;
+    }
+
+    try {
+      const [prefix, action, sessionId] = interaction.customId.split(":");
+      if (prefix !== PANEL_PREFIX || !action || !sessionId) {
+        return;
+      }
+
+      const session = this.getPanelSession(sessionId, interaction.user.id, interaction.guildId!);
+      switch (action) {
+        case "mapping":
+          await this.handlePanelMappingSelect(interaction as StringSelectMenuInteraction, session);
+          break;
+        case "refresh":
+          await this.refreshPanel(interaction, session);
+          break;
+        case "pause-toggle":
+          await this.handlePanelPauseToggle(interaction as ButtonInteraction, session);
+          break;
+        case "retranslate-latest":
+          await this.handlePanelRetranslateLatest(interaction as ButtonInteraction, session);
+          break;
+        case "restart-backlog":
+          await this.handlePanelRestartBacklog(interaction as ButtonInteraction, session);
+          break;
+        case "setup-open":
+          await this.handlePanelSetupOpen(interaction as ButtonInteraction, session);
+          break;
+        case "setup-raw":
+          await this.handlePanelSetupChannelSelect(interaction as ChannelSelectMenuInteraction, session, "raw");
+          break;
+        case "setup-output":
+          await this.handlePanelSetupChannelSelect(interaction as ChannelSelectMenuInteraction, session, "output");
+          break;
+        case "setup-log":
+          await this.handlePanelSetupChannelSelect(interaction as ChannelSelectMenuInteraction, session, "log");
+          break;
+        case "setup-clear-log":
+          session.setupLogChannelId = null;
+          session.updatedAt = Date.now();
+          await this.refreshPanel(interaction, session, "Лог-канал очищен для следующего сохранения.");
+          break;
+        case "setup-modal":
+          await this.showPanelSetupModal(interaction as ButtonInteraction, session);
+          break;
+        case "setup-back":
+          session.view = "main";
+          session.updatedAt = Date.now();
+          await this.refreshPanel(interaction, session);
+          break;
+        case "glossary-import":
+          await this.showPanelGlossaryImportModal(interaction as ButtonInteraction, session);
+          break;
+        case "glossary-list":
+          await this.handlePanelGlossaryList(interaction as ButtonInteraction, session);
+          break;
+        default:
+          await interaction.reply({ content: "Неизвестное действие панели.", ephemeral: true });
+      }
+    } catch (error) {
+      this.logger.error(
+        {
+          event: "panel_component_failed",
+          custom_id: interaction.customId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Panel interaction failed",
+      );
+      const message = error instanceof AppError ? error.message : "Панель завершилась ошибкой.";
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp({ content: message, ephemeral: true });
+      } else {
+        await interaction.reply({ content: message, ephemeral: true });
+      }
+    }
+  }
+
+  async handleModalInteraction(interaction: ModalSubmitInteraction): Promise<void> {
+    if (interaction.customId.startsWith("glossary_import|")) {
+      await this.handleGlossaryImportModal(interaction);
+      return;
+    }
+
+    if (interaction.customId.startsWith(`${PANEL_PREFIX}:setup-modal:`)) {
+      await this.handlePanelSetupModal(interaction);
     }
   }
 
@@ -157,6 +287,9 @@ export class CommandRouter {
       );
 
     return [
+      new SlashCommandBuilder()
+        .setName("panel")
+        .setDescription("Открыть единую панель управления ботом"),
       new SlashCommandBuilder()
         .setName("setup")
         .setDescription("Создать или обновить mapping raw channel -> output channel")
@@ -229,6 +362,592 @@ export class CommandRouter {
     ];
   }
 
+  private async handlePanel(interaction: ChatInputCommandInteraction): Promise<void> {
+    const mappings = this.repositories.channelMappings.listByGuildId(interaction.guildId!);
+    const sessionId = this.createPanelSession({
+      userId: interaction.user.id,
+      guildId: interaction.guildId!,
+      selectedMappingId: mappings[0]?.mapping_id ?? null,
+    });
+
+    await interaction.reply({
+      ...this.buildPanelMessage(this.getPanelSession(sessionId, interaction.user.id, interaction.guildId!)),
+      ephemeral: true,
+    });
+  }
+
+  private createPanelSession(input: { userId: string; guildId: string; selectedMappingId: string | null }): string {
+    this.cleanupPanelSessions();
+    const sessionId = createId("panel");
+    const now = Date.now();
+    this.panelSessions.set(sessionId, {
+      userId: input.userId,
+      guildId: input.guildId,
+      selectedMappingId: input.selectedMappingId,
+      view: "main",
+      setupRawChannelId: null,
+      setupOutputChannelId: null,
+      setupLogChannelId: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return sessionId;
+  }
+
+  private cleanupPanelSessions(): void {
+    const threshold = Date.now() - PANEL_SESSION_TTL_MS;
+    for (const [sessionId, session] of this.panelSessions) {
+      if (session.updatedAt < threshold) {
+        this.panelSessions.delete(sessionId);
+      }
+    }
+  }
+
+  private getPanelSession(sessionId: string, userId: string, guildId: string): PanelSession {
+    this.cleanupPanelSessions();
+    const session = this.panelSessions.get(sessionId);
+    if (!session || session.userId !== userId || session.guildId !== guildId) {
+      throw new AppError({
+        code: "PANEL_SESSION_EXPIRED",
+        message: "Панель устарела. Запустите /panel ещё раз.",
+        failureClass: "validation",
+      });
+    }
+
+    session.updatedAt = Date.now();
+    return session;
+  }
+
+  private buildPanelMessage(session: PanelSession, banner?: string) {
+    const mappings = this.repositories.channelMappings.listByGuildId(session.guildId);
+    const selectedMapping = this.resolvePanelSelectedMapping(session, mappings);
+    const guildSettings = this.repositories.guildSettings.getByGuildId(session.guildId);
+    const report = this.statusService.buildReport();
+    const statusLine = [
+      `Сервис: ${report.serviceStatus}`,
+      `Discord: ${report.discordGateway}`,
+      `DeepL: ${report.deepl}`,
+      `Очередь: ${report.queueDepth}`,
+      `Активных mappings: ${report.activeMappings}`,
+      `На паузе: ${report.pausedMappings}`,
+    ].join(" | ");
+
+    const lines = [banner, "Панель управления переводчиком", statusLine, ""];
+    if (session.view === "setup") {
+      const selected = selectedMapping;
+      lines.push(selected ? `Редактирование: <#${selected.raw_channel_id}> -> <#${selected.output_channel_id}>` : "Создание нового mapping");
+      lines.push(`Raw канал: ${session.setupRawChannelId ? `<#${session.setupRawChannelId}>` : "не выбран"}`);
+      lines.push(`Output канал: ${session.setupOutputChannelId ? `<#${session.setupOutputChannelId}>` : "не выбран"}`);
+      lines.push(`Log канал: ${session.setupLogChannelId ? `<#${session.setupLogChannelId}>` : "не задан"}`);
+      lines.push(`Пара по умолчанию: ${(selected?.source_lang ?? guildSettings?.default_source_lang ?? this.config.defaultSourceLanguage).toUpperCase()} -> ${(selected?.target_lang ?? guildSettings?.default_target_lang ?? this.config.defaultTargetLanguage).toUpperCase()}`);
+      lines.push("Дальше нажмите «Сохранить детали», чтобы ввести языки, подпись источника и режимы публикации.");
+    } else if (selectedMapping) {
+      const pending = this.repositories.translationJobs.countByMappingAndStatus(selectedMapping.mapping_id, "pending");
+      const retry = this.repositories.translationJobs.countByMappingAndStatus(selectedMapping.mapping_id, "retry_wait");
+      const failed = this.repositories.translationJobs.countByMappingAndStatus(selectedMapping.mapping_id, "failed");
+      const latest = this.repositories.processedRawMessages.getLatestForMapping(selectedMapping.mapping_id);
+      lines.push(`Выбранный mapping: <#${selectedMapping.raw_channel_id}> -> <#${selectedMapping.output_channel_id}>`);
+      lines.push(`Языки: ${selectedMapping.source_lang} -> ${selectedMapping.target_lang}`);
+      lines.push(`Рендер: ${selectedMapping.render_mode} | Медиа: ${selectedMapping.media_mode}`);
+      lines.push(`Glossary: ${selectedMapping.active_glossary_version_id ?? "none"}`);
+      lines.push(`Статус: ${selectedMapping.is_paused === 1 ? `пауза (${selectedMapping.pause_reason ?? "без причины"})` : "активен"}`);
+      lines.push(`Очередь mapping: pending=${pending} retry=${retry} failed=${failed}`);
+      lines.push(`Последний raw: ${latest?.raw_message_id ?? "none"}`);
+      lines.push("Быстрые действия ниже: пауза, перезапуск хвоста, retranslate последнего сообщения и glossary.");
+    } else {
+      lines.push("Для этого сервера ещё нет mapping. Нажмите «Настроить mapping», чтобы создать первый.");
+    }
+
+    return {
+      content: lines.filter(Boolean).join("\n").slice(0, 1_900),
+      components: session.view === "setup" ? this.buildSetupPanelComponents(session) : this.buildMainPanelComponents(session),
+    };
+  }
+
+  private buildMainPanelComponents(session: PanelSession) {
+    const mappings = this.repositories.channelMappings.listByGuildId(session.guildId);
+    const selectedMapping = this.resolvePanelSelectedMapping(session, mappings);
+    const mappingMenu = new StringSelectMenuBuilder()
+      .setCustomId(`${PANEL_PREFIX}:mapping:${this.findPanelSessionId(session)}`)
+      .setPlaceholder(mappings.length > 0 ? "Выберите mapping" : "Нет mappings")
+      .setDisabled(mappings.length === 0)
+      .addOptions(
+        (mappings.length > 0 ? mappings : [{ mapping_id: "none", raw_channel_id: "0", output_channel_id: "0", source_lang: "", target_lang: "", is_paused: 0 } as ChannelMappingRow]).map((mapping) => ({
+          label: mapping.mapping_id === "none" ? "Нет mappings" : `${mapping.source_lang} -> ${mapping.target_lang}`,
+          value: mapping.mapping_id,
+          description: mapping.mapping_id === "none" ? "Сначала создайте mapping" : `<#${mapping.raw_channel_id}> -> <#${mapping.output_channel_id}>${mapping.is_paused === 1 ? " • paused" : ""}`,
+          default: mapping.mapping_id === session.selectedMappingId,
+        })),
+      );
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`${PANEL_PREFIX}:refresh:${this.findPanelSessionId(session)}`).setLabel("Обновить").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:pause-toggle:${this.findPanelSessionId(session)}`)
+        .setLabel(selectedMapping?.is_paused === 1 ? "Resume" : "Пауза")
+        .setStyle(selectedMapping?.is_paused === 1 ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setDisabled(!selectedMapping),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:retranslate-latest:${this.findPanelSessionId(session)}`)
+        .setLabel("Retranslate latest")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!selectedMapping),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:restart-backlog:${this.findPanelSessionId(session)}`)
+        .setLabel("Перезапуск хвоста")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!selectedMapping),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:setup-open:${this.findPanelSessionId(session)}`)
+        .setLabel("Настроить mapping")
+        .setStyle(ButtonStyle.Success),
+    );
+
+    const glossaryButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:glossary-import:${this.findPanelSessionId(session)}`)
+        .setLabel("Импорт glossary")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!selectedMapping),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:glossary-list:${this.findPanelSessionId(session)}`)
+        .setLabel("Список glossary")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!selectedMapping),
+    );
+
+    return [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(mappingMenu), buttons, glossaryButtons];
+  }
+
+  private buildSetupPanelComponents(session: PanelSession) {
+    const sessionId = this.findPanelSessionId(session);
+    const rawSelect = new ChannelSelectMenuBuilder()
+      .setCustomId(`${PANEL_PREFIX}:setup-raw:${sessionId}`)
+      .setPlaceholder(session.setupRawChannelId ? `Raw: ${session.setupRawChannelId}` : "Выберите raw-канал")
+      .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setMinValues(1)
+      .setMaxValues(1);
+    const outputSelect = new ChannelSelectMenuBuilder()
+      .setCustomId(`${PANEL_PREFIX}:setup-output:${sessionId}`)
+      .setPlaceholder(session.setupOutputChannelId ? `Output: ${session.setupOutputChannelId}` : "Выберите output-канал")
+      .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setMinValues(1)
+      .setMaxValues(1);
+    const logSelect = new ChannelSelectMenuBuilder()
+      .setCustomId(`${PANEL_PREFIX}:setup-log:${sessionId}`)
+      .setPlaceholder(session.setupLogChannelId ? `Log: ${session.setupLogChannelId}` : "Опционально: log-канал")
+      .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setMinValues(1)
+      .setMaxValues(1);
+
+    const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:setup-modal:${sessionId}`)
+        .setLabel("Сохранить детали")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:setup-clear-log:${sessionId}`)
+        .setLabel("Очистить log")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:setup-back:${sessionId}`)
+        .setLabel("Назад")
+        .setStyle(ButtonStyle.Secondary),
+    );
+
+    return [
+      new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(rawSelect),
+      new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(outputSelect),
+      new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(logSelect),
+      buttons,
+    ];
+  }
+
+  private findPanelSessionId(session: PanelSession): string {
+    for (const [sessionId, stored] of this.panelSessions) {
+      if (stored === session) {
+        return sessionId;
+      }
+    }
+
+    throw new AppError({ code: "PANEL_SESSION_NOT_FOUND", message: "Панель устарела. Запустите /panel ещё раз.", failureClass: "validation" });
+  }
+
+  private resolvePanelSelectedMapping(session: PanelSession, mappings: ChannelMappingRow[]): ChannelMappingRow | null {
+    if (session.selectedMappingId) {
+      const selected = mappings.find((mapping) => mapping.mapping_id === session.selectedMappingId);
+      if (selected) {
+        return selected;
+      }
+    }
+
+    session.selectedMappingId = mappings[0]?.mapping_id ?? null;
+    return mappings[0] ?? null;
+  }
+
+  private async refreshPanel(interaction: ButtonInteraction | ChannelSelectMenuInteraction | StringSelectMenuInteraction, session: PanelSession, banner?: string): Promise<void> {
+    await interaction.update(this.buildPanelMessage(session, banner));
+  }
+
+  private async refreshDeferredPanel(interaction: ButtonInteraction, session: PanelSession, banner?: string): Promise<void> {
+    await interaction.editReply(this.buildPanelMessage(session, banner));
+  }
+
+  private async handlePanelMappingSelect(interaction: StringSelectMenuInteraction, session: PanelSession): Promise<void> {
+    session.selectedMappingId = interaction.values[0] === "none" ? null : interaction.values[0];
+    session.view = "main";
+    await this.refreshPanel(interaction, session);
+  }
+
+  private async handlePanelPauseToggle(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    await interaction.deferUpdate();
+    const mapping = this.requireSelectedMapping(session);
+    if (mapping.is_paused === 1) {
+      await this.glossaryManager.validateLanguagePair(mapping.source_lang, mapping.target_lang);
+      this.repositories.channelMappings.setPaused(mapping.mapping_id, false, null);
+      await this.refreshDeferredPanel(interaction, session, "Mapping снят с паузы.");
+      return;
+    }
+
+    this.repositories.channelMappings.setPaused(mapping.mapping_id, true, "Paused from /panel");
+    await this.refreshDeferredPanel(interaction, session, "Mapping поставлен на паузу.");
+  }
+
+  private async handlePanelRetranslateLatest(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    await interaction.deferUpdate();
+    const mapping = this.requireSelectedMapping(session);
+    const latestRaw = this.repositories.processedRawMessages.getLatestForMapping(mapping.mapping_id);
+    if (!latestRaw) {
+      throw new AppError({ code: "LATEST_RAW_NOT_FOUND", message: "Для mapping ещё нет raw сообщений.", failureClass: "validation" });
+    }
+
+    await this.scheduleRetranslate(latestRaw.raw_message_id);
+    await this.refreshDeferredPanel(interaction, session, `Retranslate запланирован для ${latestRaw.raw_message_id}.`);
+  }
+
+  private async handlePanelRestartBacklog(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    await interaction.deferUpdate();
+    const mapping = this.requireSelectedMapping(session);
+    if (mapping.is_paused === 1) {
+      await this.glossaryManager.validateLanguagePair(mapping.source_lang, mapping.target_lang);
+      this.repositories.channelMappings.setPaused(mapping.mapping_id, false, null);
+    }
+
+    const rawMessageIds = this.repositories.translationJobs.requeueFailedByMappingId(mapping.mapping_id, 50);
+    this.repositories.failedJobs.markResolvedByRawMessageIds(rawMessageIds, "Requeued from /panel");
+    await this.refreshDeferredPanel(
+      interaction,
+      session,
+      rawMessageIds.length > 0
+        ? `Хвост перезапущен: requeue ${rawMessageIds.length} failed job(s).`
+        : "Хвост проверен: failed jobs не найдено, pending/retry будут обработаны автоматически.",
+    );
+  }
+
+  private async handlePanelSetupOpen(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    const mapping = session.selectedMappingId ? this.repositories.channelMappings.getByMappingId(session.selectedMappingId) : null;
+    const guildSettings = this.repositories.guildSettings.getByGuildId(session.guildId);
+    session.view = "setup";
+    session.setupRawChannelId = mapping?.raw_channel_id ?? null;
+    session.setupOutputChannelId = mapping?.output_channel_id ?? null;
+    session.setupLogChannelId = guildSettings?.log_channel_id ?? null;
+    await this.refreshPanel(interaction, session);
+  }
+
+  private async handlePanelSetupChannelSelect(
+    interaction: ChannelSelectMenuInteraction,
+    session: PanelSession,
+    field: "raw" | "output" | "log",
+  ): Promise<void> {
+    const selectedChannelId = interaction.values[0] ?? null;
+    if (field === "raw") {
+      session.setupRawChannelId = selectedChannelId;
+    } else if (field === "output") {
+      session.setupOutputChannelId = selectedChannelId;
+    } else {
+      session.setupLogChannelId = selectedChannelId;
+    }
+    session.updatedAt = Date.now();
+    await this.refreshPanel(interaction, session);
+  }
+
+  private async showPanelSetupModal(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    const mapping = session.selectedMappingId ? this.repositories.channelMappings.getByMappingId(session.selectedMappingId) : null;
+    const guildSettings = this.repositories.guildSettings.getByGuildId(session.guildId);
+    const modal = new ModalBuilder().setCustomId(`${PANEL_PREFIX}:setup-modal:${this.findPanelSessionId(session)}`).setTitle("Настройка mapping");
+    const sourceLangInput = new TextInputBuilder()
+      .setCustomId("source_lang")
+      .setLabel("Язык источника")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setValue((mapping?.source_lang ?? guildSettings?.default_source_lang ?? this.config.defaultSourceLanguage).toUpperCase());
+    const targetLangInput = new TextInputBuilder()
+      .setCustomId("target_lang")
+      .setLabel("Язык перевода")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setValue((mapping?.target_lang ?? guildSettings?.default_target_lang ?? this.config.defaultTargetLanguage).toUpperCase());
+    const sourceLabelInput = new TextInputBuilder()
+      .setCustomId("source_label")
+      .setLabel("Подпись источника")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setValue(mapping?.source_label_override ?? "");
+    const renderModeInput = new TextInputBuilder()
+      .setCustomId("render_mode")
+      .setLabel("Render mode: auto | embed | plain")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setValue(mapping?.render_mode ?? "auto");
+    const mediaModeInput = new TextInputBuilder()
+      .setCustomId("media_mode")
+      .setLabel("Media mode: auto | mirror | link_only")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setValue(mapping?.media_mode ?? "auto");
+
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(sourceLangInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(targetLangInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(sourceLabelInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(renderModeInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(mediaModeInput),
+    );
+
+    await interaction.showModal(modal);
+  }
+
+  private async handlePanelSetupModal(interaction: ModalSubmitInteraction): Promise<void> {
+    if (!interaction.inGuild() || !interaction.guild) {
+      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", ephemeral: true });
+      return;
+    }
+
+    const member = await interaction.guild.members.fetch(interaction.user.id);
+    if (!this.hasAdminAccess(member)) {
+      await interaction.reply({ content: "Недостаточно прав для использования этой команды.", ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const [, , sessionId] = interaction.customId.split(":");
+    const session = this.getPanelSession(sessionId, interaction.user.id, interaction.guildId!);
+    if (!session.setupRawChannelId || !session.setupOutputChannelId) {
+      throw new AppError({
+        code: "PANEL_SETUP_CHANNELS_REQUIRED",
+        message: "Сначала выберите raw и output каналы в панели.",
+        failureClass: "validation",
+      });
+    }
+
+    const rawChannel = ensureTextChannel(await this.client.channels.fetch(session.setupRawChannelId));
+    const outputChannel = ensureTextChannel(await this.client.channels.fetch(session.setupOutputChannelId));
+    const logChannel = session.setupLogChannelId ? ensureTextChannel(await this.client.channels.fetch(session.setupLogChannelId)) : null;
+    const renderMode = this.parseRenderMode(interaction.fields.getTextInputValue("render_mode"));
+    const mediaMode = this.parseMediaMode(interaction.fields.getTextInputValue("media_mode"));
+
+    const result = await this.saveMapping({
+      guildId: interaction.guildId!,
+      guildName: interaction.guild.name,
+      actorId: interaction.user.id,
+      member,
+      rawChannel,
+      outputChannel,
+      logChannel,
+      sourceLang: interaction.fields.getTextInputValue("source_lang").trim().toUpperCase(),
+      targetLang: interaction.fields.getTextInputValue("target_lang").trim().toUpperCase(),
+      sourceLabel: interaction.fields.getTextInputValue("source_label").trim() || null,
+      renderMode,
+      mediaMode,
+      dryRun: false,
+      existingMappingId: session.selectedMappingId,
+    });
+
+    session.selectedMappingId = result.mappingId;
+    session.view = "main";
+    session.updatedAt = Date.now();
+    await interaction.editReply({
+      ...this.buildPanelMessage(session, `Mapping сохранен. ${result.summaryLines.join(" | ")}`),
+    });
+  }
+
+  private async showPanelGlossaryImportModal(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    const mapping = this.requireSelectedMapping(session);
+    const customId = `glossary_import|${mapping.source_lang}|${mapping.target_lang}|false|false`;
+    const modal = new ModalBuilder().setCustomId(customId).setTitle("Массовый импорт Glossary");
+    const payloadInput = new TextInputBuilder()
+      .setCustomId("payload")
+      .setLabel("Вставьте блок с персонажами, скиллами и терминами")
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder("[characters]\nGojo\nSukuna\n\n[skills]\nBlack Flash\n\n[terms]\nawakening = пробуждение")
+      .setRequired(true)
+      .setMaxLength(4000);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(payloadInput));
+    await interaction.showModal(modal);
+  }
+
+  private async handlePanelGlossaryList(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    const mapping = this.requireSelectedMapping(session);
+    const lines = this.formatGlossaryLines(session.guildId, mapping.source_lang, mapping.target_lang);
+    await interaction.reply({ content: lines.join("\n").slice(0, 1_950), ephemeral: true });
+  }
+
+  private requireSelectedMapping(session: PanelSession): ChannelMappingRow {
+    const mapping = session.selectedMappingId ? this.repositories.channelMappings.getByMappingId(session.selectedMappingId) : null;
+    if (!mapping) {
+      throw new AppError({ code: "PANEL_MAPPING_REQUIRED", message: "Сначала выберите mapping в панели.", failureClass: "validation" });
+    }
+    return mapping;
+  }
+
+  private parseRenderMode(value: string): RenderMode {
+    const normalized = value.trim().toLowerCase() as RenderMode;
+    if (!RENDER_MODE.includes(normalized)) {
+      throw new AppError({ code: "INVALID_RENDER_MODE", message: `render_mode должен быть одним из: ${RENDER_MODE.join(", ")}.`, failureClass: "validation" });
+    }
+    return normalized;
+  }
+
+  private parseMediaMode(value: string): MediaMode {
+    const normalized = value.trim().toLowerCase() as MediaMode;
+    if (!MEDIA_MODE.includes(normalized)) {
+      throw new AppError({ code: "INVALID_MEDIA_MODE", message: `media_mode должен быть одним из: ${MEDIA_MODE.join(", ")}.`, failureClass: "validation" });
+    }
+    return normalized;
+  }
+
+  private formatGlossaryLines(guildId: string, sourceLang: string, targetLang: string): string[] {
+    const rules = this.repositories.glossaryRules.listActiveByPair(guildId, sourceLang, targetLang).slice(0, 20);
+    if (rules.length === 0) {
+      return [`Glossary ${sourceLang} -> ${targetLang}: правил пока нет.`];
+    }
+
+    return [
+      `Glossary ${sourceLang} -> ${targetLang}:`,
+      ...rules.map((rule) => `- ${rule.source_term} => ${rule.rule_type === "preserve" ? "(preserve)" : (rule.target_term ?? "")}`),
+    ];
+  }
+
+  private async scheduleRetranslate(rawMessageId: string): Promise<void> {
+    const output = this.repositories.translatedOutputs.getByRawMessageId(rawMessageId);
+    if (output) {
+      await this.tryDeletePublishedMessages(output.output_channel_id, JSON.parse(output.all_message_ids_json) as string[]);
+      this.repositories.translatedOutputs.deleteByRawMessageId(rawMessageId);
+    }
+
+    const existingJob = this.repositories.translationJobs.getByRawMessageId(rawMessageId);
+    if (existingJob) {
+      this.repositories.translationJobs.requeueByRawMessageId(rawMessageId);
+      return;
+    }
+
+    const raw = this.repositories.processedRawMessages.getByRawMessageId(rawMessageId);
+    if (!raw) {
+      throw new AppError({ code: "RAW_RECORD_MISSING", message: "Raw payload не найден в БД.", failureClass: "validation" });
+    }
+
+    this.repositories.translationJobs.enqueue(rawMessageId, raw.mapping_id);
+  }
+
+  private async saveMapping(input: {
+    guildId: string;
+    guildName: string;
+    actorId: string;
+    member: GuildMember;
+    rawChannel: SupportedSetupChannel | null;
+    outputChannel: SupportedSetupChannel | null;
+    logChannel: SupportedSetupChannel | null;
+    sourceLang: string;
+    targetLang: string;
+    sourceLabel: string | null;
+    renderMode: RenderMode;
+    mediaMode: MediaMode;
+    dryRun: boolean;
+    existingMappingId: string | null;
+  }): Promise<{ mappingId: string; summaryLines: string[] }> {
+    if (!input.rawChannel || !input.outputChannel) {
+      throw new AppError({ code: "INVALID_CHANNEL_TYPE", message: "Нужны текстовые каналы.", failureClass: "validation" });
+    }
+    if (input.rawChannel.id === input.outputChannel.id) {
+      throw new AppError({ code: "RAW_EQUALS_OUTPUT", message: "raw и output не могут совпадать.", failureClass: "validation" });
+    }
+
+    const issues = validateSetupPermissions({
+      botMember: input.member.guild.members.me ?? input.member.guild.members.cache.get(this.client.user!.id)!,
+      rawChannel: input.rawChannel,
+      outputChannel: input.outputChannel,
+    });
+
+    await this.deepl.validateAuth();
+    await this.glossaryManager.validateLanguagePair(input.sourceLang, input.targetLang);
+    if (issues.length > 0) {
+      throw new AppError({ code: "SETUP_VALIDATION_FAILED", message: issues.join("\n"), failureClass: "validation" });
+    }
+
+    const activeGlossary = this.repositories.glossaryVersions.getActiveByPair(input.guildId, input.sourceLang, input.targetLang);
+    const existing = (input.existingMappingId ? this.repositories.channelMappings.getByMappingId(input.existingMappingId) : null)
+      ?? this.repositories.channelMappings.getByRawChannelId(input.rawChannel.id);
+    const mappingId = existing?.mapping_id ?? createId("map");
+
+    const summaryLines = [
+      `Guild: ${input.guildName}`,
+      `Raw: #${input.rawChannel.name}`,
+      `Output: #${input.outputChannel.name}`,
+      `Pair: ${input.sourceLang} -> ${input.targetLang}`,
+      `Render/media: ${input.renderMode} / ${input.mediaMode}`,
+      activeGlossary ? `Glossary: active ${activeGlossary.glossary_version_id}` : "Glossary: нет активной версии",
+      `Log channel: ${input.logChannel ? `#${input.logChannel.name}` : this.config.logChannelId ? `ENV ${this.config.logChannelId}` : "not set"}`,
+    ];
+
+    if (input.dryRun) {
+      return { mappingId, summaryLines };
+    }
+
+    this.repositories.guildSettings.upsert({
+      guildId: input.guildId,
+      defaultSourceLang: input.sourceLang,
+      defaultTargetLang: input.targetLang,
+      adminRoleIdsJson: JSON.stringify(this.config.adminRoleIds),
+      logChannelId: input.logChannel?.id ?? null,
+      publishOriginalOnFailure: this.config.publishOriginalOnExhaustedTransientFailure,
+      status: "active",
+    });
+    this.repositories.channelMappings.upsert({
+      mappingId,
+      guildId: input.guildId,
+      rawChannelId: input.rawChannel.id,
+      outputChannelId: input.outputChannel.id,
+      sourceLang: input.sourceLang,
+      targetLang: input.targetLang,
+      sourceLabelOverride: input.sourceLabel,
+      activeGlossaryVersionId: activeGlossary?.glossary_version_id ?? null,
+      renderMode: input.renderMode,
+      mediaMode: input.mediaMode,
+      isPaused: false,
+      pauseReason: null,
+    });
+    this.repositories.auditLog.insert({
+      guildId: input.guildId,
+      actorType: "user",
+      actorId: input.actorId,
+      action: "setup_mapping",
+      subjectType: "mapping",
+      subjectId: mappingId,
+      details: {
+        rawChannelId: input.rawChannel.id,
+        outputChannelId: input.outputChannel.id,
+        sourceLang: input.sourceLang,
+        targetLang: input.targetLang,
+        sourceLabel: input.sourceLabel,
+        renderMode: input.renderMode,
+        mediaMode: input.mediaMode,
+      },
+    });
+
+    return { mappingId, summaryLines };
+  }
+
   private async handleSetup(interaction: ChatInputCommandInteraction, member: GuildMember): Promise<void> {
     const rawChannel = ensureTextChannel(interaction.options.getChannel("raw_channel", true));
     const outputChannel = ensureTextChannel(interaction.options.getChannel("output_channel", true));
@@ -238,88 +957,25 @@ export class CommandRouter {
     const sourceLabel = interaction.options.getString("source_label");
     const dryRun = interaction.options.getBoolean("dry_run") ?? false;
 
-    if (!rawChannel || !outputChannel) {
-      throw new AppError({ code: "INVALID_CHANNEL_TYPE", message: "Нужны текстовые каналы.", failureClass: "validation" });
-    }
-    if (rawChannel.id === outputChannel.id) {
-      throw new AppError({ code: "RAW_EQUALS_OUTPUT", message: "raw и output не могут совпадать.", failureClass: "validation" });
-    }
-
-    const issues = validateSetupPermissions({
-      botMember: member.guild.members.me ?? member.guild.members.cache.get(this.client.user!.id)!,
+    const result = await this.saveMapping({
+      guildId: interaction.guildId!,
+      guildName: interaction.guild!.name,
+      actorId: interaction.user.id,
+      member,
       rawChannel,
       outputChannel,
-    });
-
-    await this.deepl.validateAuth();
-    await this.glossaryManager.validateLanguagePair(sourceLang, targetLang);
-    if (issues.length > 0) {
-      throw new AppError({ code: "SETUP_VALIDATION_FAILED", message: issues.join("\n"), failureClass: "validation" });
-    }
-
-    const activeGlossary = this.repositories.glossaryVersions.getActiveByPair(interaction.guildId!, sourceLang, targetLang);
-    const existing = this.repositories.channelMappings.getByRawChannelId(rawChannel.id);
-    const mappingId = existing?.mapping_id ?? createId("map");
-
-    const glossaryNote = activeGlossary
-      ? `Glossary: active ${activeGlossary.glossary_version_id}`
-      : "Glossary: нет активной версии — перевод будет выполняться без глоссария (добавьте термины через /glossary add)";
-
-    const summaryLines = [
-      `Guild: ${interaction.guild!.name}`,
-      `Raw: #${rawChannel.name}`,
-      `Output: #${outputChannel.name}`,
-      `Pair: ${sourceLang} -> ${targetLang}`,
-      glossaryNote,
-      `Log channel: ${logChannel ? `#${logChannel.name}` : this.config.logChannelId ? `ENV ${this.config.logChannelId}` : "not set"}`,
-    ];
-
-    if (dryRun) {
-      await interaction.reply({ content: `Dry-run OK:\n${summaryLines.join("\n")}`, ephemeral: true });
-      return;
-    }
-
-    this.repositories.guildSettings.upsert({
-      guildId: interaction.guildId!,
-      defaultSourceLang: sourceLang,
-      defaultTargetLang: targetLang,
-      adminRoleIdsJson: JSON.stringify(this.config.adminRoleIds),
-      logChannelId: logChannel?.id ?? this.config.logChannelId ?? null,
-      publishOriginalOnFailure: this.config.publishOriginalOnExhaustedTransientFailure,
-      status: "active",
-    });
-    this.repositories.channelMappings.upsert({
-      mappingId,
-      guildId: interaction.guildId!,
-      rawChannelId: rawChannel.id,
-      outputChannelId: outputChannel.id,
+      logChannel,
       sourceLang,
       targetLang,
-      sourceLabelOverride: sourceLabel,
-      activeGlossaryVersionId: activeGlossary?.glossary_version_id ?? null,
+      sourceLabel,
       renderMode: "auto",
       mediaMode: "auto",
-      isPaused: false,
-      pauseReason: null,
-    });
-    this.repositories.auditLog.insert({
-      guildId: interaction.guildId!,
-      actorType: "user",
-      actorId: interaction.user.id,
-      action: "setup_mapping",
-      subjectType: "mapping",
-      subjectId: mappingId,
-      details: {
-        rawChannelId: rawChannel.id,
-        outputChannelId: outputChannel.id,
-        sourceLang,
-        targetLang,
-        sourceLabel,
-      },
+      dryRun,
+      existingMappingId: null,
     });
 
     await interaction.reply({
-      content: `Mapping сохранен.\n${summaryLines.join("\n")}`,
+      content: `${dryRun ? "Dry-run OK" : "Mapping сохранен."}\n${result.summaryLines.join("\n")}`,
       ephemeral: true,
     });
   }
@@ -439,26 +1095,7 @@ export class CommandRouter {
       });
     }
 
-    const output = this.repositories.translatedOutputs.getByRawMessageId(rawMessageId);
-    if (output) {
-      await this.tryDeletePublishedMessages(output.output_channel_id, JSON.parse(output.all_message_ids_json) as string[]);
-      this.repositories.translatedOutputs.deleteByRawMessageId(rawMessageId);
-    }
-
-    const existingJob = this.repositories.translationJobs.getByRawMessageId(rawMessageId);
-    if (existingJob) {
-      this.repositories.translationJobs.requeueByRawMessageId(rawMessageId);
-    } else {
-      const raw = this.repositories.processedRawMessages.getByRawMessageId(rawMessageId);
-      if (!raw) {
-        throw new AppError({
-          code: "RAW_RECORD_MISSING",
-          message: "Raw payload не найден в БД.",
-          failureClass: "validation",
-        });
-      }
-      this.repositories.translationJobs.enqueue(rawMessageId, raw.mapping_id);
-    }
+    await this.scheduleRetranslate(rawMessageId);
 
     await interaction.reply({ content: `Retranslate запланирован для raw message ${rawMessageId}.`, ephemeral: true });
   }

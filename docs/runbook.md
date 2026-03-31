@@ -4,7 +4,8 @@
 - Attach a persistent volume to `/data`
 - Invite the bot with `View Channels`, `Read Message History`, `Send Messages`, `Embed Links`, `Attach Files`, `Use Slash Commands`
 - Enable the `MESSAGE_CONTENT` privileged intent
-- Start the service and run `/setup` in Discord
+- Start the service and run `/panel` in Discord for day-to-day administration (or `/setup` if you prefer the legacy flow)
+- See [docs/discord-panel.md](docs/discord-panel.md) for the full panel guide and queue restart flow
 
 ## Raw intake channel behavior
 

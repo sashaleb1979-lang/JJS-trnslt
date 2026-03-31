@@ -133,6 +133,44 @@ export class TranslationJobsRepository {
       .run(nowIso(), nowIso(), rawMessageId);
   }
 
+  requeueFailedByMappingId(mappingId: string, limit = 25): string[] {
+    const failed = this.db
+      .prepare<[string, number], { raw_message_id: string }>(
+        `SELECT raw_message_id
+         FROM translation_jobs
+         WHERE mapping_id = ? AND status = 'failed'
+         ORDER BY updated_at DESC
+         LIMIT ?`,
+      )
+      .all(mappingId, limit);
+
+    if (failed.length === 0) {
+      return [];
+    }
+
+    const now = nowIso();
+    const requeue = this.db.transaction((rawMessageIds: string[]) => {
+      const statement = this.db.prepare(
+        `UPDATE translation_jobs
+         SET status = 'pending',
+             next_attempt_at = ?,
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             finished_at = NULL,
+             updated_at = ?
+         WHERE raw_message_id = ?`,
+      );
+
+      for (const rawMessageId of rawMessageIds) {
+        statement.run(now, now, rawMessageId);
+      }
+    });
+
+    const rawMessageIds = failed.map((entry) => entry.raw_message_id);
+    requeue(rawMessageIds);
+    return rawMessageIds;
+  }
+
   resetExpiredInProgressJobs(): number {
     const result = this.db
       .prepare(

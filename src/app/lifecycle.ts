@@ -122,8 +122,10 @@ export class BotApplication {
     this.client.on("interactionCreate", (interaction) => {
       if (interaction.isChatInputCommand()) {
         void this.commandRouter.handleInteraction(interaction);
-      } else if (interaction.isModalSubmit() && interaction.customId.startsWith("glossary_import|")) {
-        void this.commandRouter.handleGlossaryImportModal(interaction);
+      } else if (interaction.isButton() || interaction.isChannelSelectMenu() || interaction.isStringSelectMenu()) {
+        void this.commandRouter.handleComponentInteraction(interaction);
+      } else if (interaction.isModalSubmit()) {
+        void this.commandRouter.handleModalInteraction(interaction);
       }
     });
 

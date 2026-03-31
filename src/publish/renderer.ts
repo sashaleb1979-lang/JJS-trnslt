@@ -24,7 +24,7 @@ export class PublishRenderer {
           {
             embeds: [
               {
-                title,
+                title: title ?? undefined,
                 description: fitEmbedDescription(finalBody || "Оригинальный пост без текста."),
                 footer,
                 url: input.payload.urls[0]?.url,
@@ -43,7 +43,7 @@ export class PublishRenderer {
         mode: "plain",
         messages: [
           {
-            content: `**${title}**\n\n${chunks[0]}\n\n_${footer}_`,
+            content: `${title ? `**${title}**\n\n` : ""}${chunks[0]}\n\n_${footer}_`,
             files: input.media.files,
           },
         ],
@@ -54,7 +54,7 @@ export class PublishRenderer {
       {
         embeds: [
           {
-            title,
+            title: title ?? undefined,
             description: fitEmbedDescription(chunks[0]),
             footer,
             url: input.payload.urls[0]?.url,
@@ -78,22 +78,13 @@ export class PublishRenderer {
     };
   }
 
-  private resolveTitle(payload: PostPayload, translatedBlocks: Map<string, string>): string {
+  private resolveTitle(payload: PostPayload, translatedBlocks: Map<string, string>): string | null {
     const embedTitleKey = payload.text_blocks.find((block) => block.block_type === "embed_title")?.block_id;
     if (embedTitleKey && translatedBlocks.get(embedTitleKey)?.trim()) {
       return translatedBlocks.get(embedTitleKey)!.trim().slice(0, 256);
     }
 
-    const contentBlock = payload.text_blocks.find((block) => block.block_type === "content_body");
-    if (contentBlock) {
-      const text = translatedBlocks.get(contentBlock.block_id) ?? contentBlock.source_text;
-      const firstLine = text.split("\n").find((line) => line.trim())?.replace(/[*_`>#-]/g, "").trim();
-      if (firstLine) {
-        return firstLine.slice(0, 256);
-      }
-    }
-
-    return payload.detected_source_label.slice(0, 256);
+    return null;
   }
 
   private resolveBody(payload: PostPayload, translatedBlocks: Map<string, string>): string {
