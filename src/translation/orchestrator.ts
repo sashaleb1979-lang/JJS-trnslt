@@ -213,6 +213,13 @@ export class TranslationOrchestrator {
 
   private async translatePayload(payload: PostPayload, mapping: ChannelMappingRow): Promise<TranslationResult> {
     const meaningfulBlockCount = payload.text_blocks.filter((block) => hasMeaningfulText(block.source_text)).length;
+    const localGlossaryRules = this.repositories.glossaryRules
+      .listActiveByPair(mapping.guild_id, mapping.source_lang, mapping.target_lang)
+      .map((rule) => ({
+        sourceTerm: rule.source_term,
+        targetTerm: rule.target_term,
+        ruleType: rule.rule_type,
+      }));
     // Glossary is optional — attempt to get one but fall back to glossary-free
     // translation if none is configured or not yet ready. This ensures messages
     // are always translated rather than blocked by a missing glossary.
@@ -240,7 +247,7 @@ export class TranslationOrchestrator {
     }
 
     try {
-      const initialResult = await this.executeTranslation(payload, mapping, glossaryId, glossaryVersionId, mapping.source_lang);
+      const initialResult = await this.executeTranslation(payload, mapping, glossaryId, glossaryVersionId, mapping.source_lang, localGlossaryRules);
       if (!this.shouldRetrySuspiciousNoop(initialResult, meaningfulBlockCount)) {
         return initialResult;
       }
@@ -260,7 +267,7 @@ export class TranslationOrchestrator {
         `DeepL returned untranslated content; retrying without glossary and with source language autodetect (source=${mapping.source_lang}, target=${mapping.target_lang}, suspicious_blocks=${initialResult.untranslatedMeaningfulBlockCount}, aggregate_untranslated=${initialResult.aggregateUntranslated})`,
       );
 
-      const retryResult = await this.executeTranslation(payload, mapping, undefined, undefined, undefined);
+      const retryResult = await this.executeTranslation(payload, mapping, undefined, undefined, undefined, localGlossaryRules);
       if (!this.shouldRetrySuspiciousNoop(retryResult, meaningfulBlockCount)) {
         return retryResult;
       }
@@ -301,7 +308,7 @@ export class TranslationOrchestrator {
           },
           "Translation failed because glossary is unavailable; retrying without glossary",
         );
-        return await this.executeTranslation(payload, mapping, undefined, undefined, mapping.source_lang);
+        return await this.executeTranslation(payload, mapping, undefined, undefined, mapping.source_lang, localGlossaryRules);
       }
       throw error;
     }
@@ -313,6 +320,7 @@ export class TranslationOrchestrator {
     glossaryId: string | undefined,
     glossaryVersionId: string | undefined,
     sourceLang: string | undefined,
+    localGlossaryRules: Array<{ sourceTerm: string; targetTerm: string | null; ruleType: "fixed" | "preserve" }>,
   ): Promise<TranslationResult> {
     const plans = this.segmenter.buildPlans({
       textBlocks: payload.text_blocks,
@@ -320,6 +328,7 @@ export class TranslationOrchestrator {
       targetLang: mapping.target_lang,
       glossaryId,
       glossaryVersionId,
+      localGlossaryRules,
       context: this.buildTranslationContext(payload),
     });
 

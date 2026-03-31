@@ -1,6 +1,6 @@
 import { CanonicalTextBlock, TranslationBatchItem, TranslationRequestPlan } from "../domain/types";
 import { chunkText, hasMeaningfulText } from "../utils/text";
-import { protectText } from "./token-protector";
+import { LocalGlossaryRule, protectText } from "./token-protector";
 
 const MAX_BATCH_ITEMS = 40;
 const MAX_BATCH_BYTES = 100 * 1024;
@@ -13,9 +13,10 @@ export class TranslationSegmenter {
     targetLang: string;
     glossaryId?: string;
     glossaryVersionId?: string;
+    localGlossaryRules?: LocalGlossaryRule[];
     context: string;
   }): TranslationRequestPlan[] {
-    const items = this.segmentBlocks(input.textBlocks);
+    const items = this.segmentBlocks(input.textBlocks, input.localGlossaryRules ?? []);
     if (items.length === 0) {
       return [];
     }
@@ -57,7 +58,7 @@ export class TranslationSegmenter {
     return batches;
   }
 
-  private segmentBlocks(blocks: CanonicalTextBlock[]): TranslationBatchItem[] {
+  private segmentBlocks(blocks: CanonicalTextBlock[], localGlossaryRules: LocalGlossaryRule[]): TranslationBatchItem[] {
     const items: TranslationBatchItem[] = [];
     for (const block of blocks) {
       if (!hasMeaningfulText(block.source_text)) {
@@ -70,13 +71,14 @@ export class TranslationSegmenter {
       }
 
       parts.forEach((part, index) => {
-        const protectedResult = protectText(part);
+        const protectedResult = protectText(part, localGlossaryRules);
         items.push({
           blockId: parts.length > 1 ? `${block.block_id}:part:${index}` : block.block_id,
           originalText: part,
           text: protectedResult.protectedText,
           tokenMap: protectedResult.tokenMap,
           protectedTokens: Array.from(protectedResult.tokenMap.keys()),
+          localGlossaryMatchCount: protectedResult.glossaryMatchCount,
         });
       });
     }

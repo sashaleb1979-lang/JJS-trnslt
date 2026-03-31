@@ -18,19 +18,25 @@ export class GlossaryRulesRepository {
       .all(guildId, sourceLang, targetLang);
   }
 
-  listByGuild(guildId: string, query?: string): GlossaryRuleRow[] {
+  listByGuild(guildId: string, query?: string, includeArchived = false): GlossaryRuleRow[] {
     if (query) {
-      return this.db
-        .prepare<string[], GlossaryRuleRow>(
-          `SELECT * FROM glossary_rules
+      const sql = includeArchived
+        ? `SELECT * FROM glossary_rules
            WHERE guild_id = ? AND (source_term LIKE ? OR target_term LIKE ?)
-           ORDER BY updated_at DESC`,
-        )
-        .all(guildId, `%${query}%`, `%${query}%`);
+           ORDER BY updated_at DESC`
+        : `SELECT * FROM glossary_rules
+           WHERE guild_id = ? AND status = 'active' AND (source_term LIKE ? OR target_term LIKE ?)
+           ORDER BY updated_at DESC`;
+
+      return this.db.prepare<string[], GlossaryRuleRow>(sql).all(guildId, `%${query}%`, `%${query}%`);
     }
 
+    const sql = includeArchived
+      ? "SELECT * FROM glossary_rules WHERE guild_id = ? ORDER BY updated_at DESC"
+      : "SELECT * FROM glossary_rules WHERE guild_id = ? AND status = 'active' ORDER BY updated_at DESC";
+
     return this.db
-      .prepare<string, GlossaryRuleRow>("SELECT * FROM glossary_rules WHERE guild_id = ? ORDER BY updated_at DESC")
+      .prepare<string, GlossaryRuleRow>(sql)
       .all(guildId);
   }
 
@@ -111,10 +117,11 @@ export class GlossaryRulesRepository {
     entries: BulkImportEntry[];
     replaceExisting: boolean;
     userId: string;
-  }): { added: number; updated: number; skipped: number } {
+  }): { added: number; updated: number; unchanged: number; conflictsSkipped: number } {
     let added = 0;
     let updated = 0;
-    let skipped = 0;
+    let unchanged = 0;
+    let conflictsSkipped = 0;
 
     const tx = this.db.transaction(() => {
       for (const entry of input.entries) {
@@ -123,15 +130,14 @@ export class GlossaryRulesRepository {
         if (existing) {
           const isExactDuplicate = existing.rule_type === entry.mode && existing.target_term === entry.targetTerm;
           if (isExactDuplicate) {
-            skipped++;
+            unchanged++;
             continue;
           }
           if (!input.replaceExisting) {
-            skipped++;
+            conflictsSkipped++;
             continue;
           }
-          // Archive old rule and add updated version
-          this.archiveRule(input.guildId, input.sourceLang, input.targetLang, entry.sourceTerm, input.userId);
+          this.deleteRule(input.guildId, input.sourceLang, input.targetLang, entry.sourceTerm);
           this.addRule({
             guildId: input.guildId,
             sourceLang: input.sourceLang,
@@ -160,7 +166,38 @@ export class GlossaryRulesRepository {
     });
 
     tx();
-    return { added, updated, skipped };
+    return { added, updated, unchanged, conflictsSkipped };
+  }
+
+  deleteRule(guildId: string, sourceLang: string, targetLang: string, sourceTerm: string): boolean {
+    const result = this.db
+      .prepare(
+        `DELETE FROM glossary_rules
+         WHERE guild_id = ? AND source_lang = ? AND target_lang = ? AND source_term = ?`,
+      )
+      .run(guildId, sourceLang, targetLang, sourceTerm);
+
+    return result.changes > 0;
+  }
+
+  deleteAllByPair(guildId: string, sourceLang: string, targetLang: string): number {
+    const result = this.db
+      .prepare(
+        `DELETE FROM glossary_rules
+         WHERE guild_id = ? AND source_lang = ? AND target_lang = ?`,
+      )
+      .run(guildId, sourceLang, targetLang);
+    return result.changes;
+  }
+
+  deleteAllByGuild(guildId: string): number {
+    const result = this.db
+      .prepare(
+        `DELETE FROM glossary_rules
+         WHERE guild_id = ?`,
+      )
+      .run(guildId);
+    return result.changes;
   }
 
   archiveAllByPair(guildId: string, sourceLang: string, targetLang: string, userId: string): number {

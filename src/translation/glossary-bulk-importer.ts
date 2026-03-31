@@ -28,6 +28,8 @@ export interface BulkImportSummary {
 
 type Section = "characters" | "skills" | "terms";
 
+const BULLET_PREFIX_REGEX = /^[-*•]+\s*/;
+
 /**
  * Parse a bulk glossary import payload.
  *
@@ -69,6 +71,62 @@ export function parseBulkGlossaryPayload(raw: string): BulkImportParseResult {
   let currentSection: Section | null = null;
   const seen = new Set<string>(); // lowercased source_term for dedup
 
+  const parseAsPreserve = (value: string, lineNo: number, content: string) => {
+    const sourceTerm = value.trim();
+    if (!sourceTerm) {
+      return;
+    }
+
+    const key = sourceTerm.toLowerCase();
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    entries.push({ sourceTerm, mode: "preserve", targetTerm: null });
+  };
+
+  const parseAsFixed = (value: string, lineNo: number, content: string) => {
+    const arrowIdx = value.includes("=>") ? value.indexOf("=>") : value.indexOf("=");
+    if (arrowIdx === -1) {
+      errors.push({
+        lineNo,
+        content,
+        reason: "Отсутствует знак = (ожидается формат: source = target)",
+      });
+      return;
+    }
+
+    const sourceTerm = value.slice(0, arrowIdx).trim();
+    const targetTerm = value.slice(arrowIdx + (value.includes("=>") ? 2 : 1)).trim();
+
+    if (!sourceTerm) {
+      errors.push({
+        lineNo,
+        content,
+        reason: "source_term пустой (левая часть от =)",
+      });
+      return;
+    }
+
+    if (!targetTerm) {
+      errors.push({
+        lineNo,
+        content,
+        reason: "target_term пустой (правая часть от =)",
+      });
+      return;
+    }
+
+    const key = sourceTerm.toLowerCase();
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    entries.push({ sourceTerm, mode: "fixed", targetTerm });
+  };
+
   for (let i = 0; i < lines.length; i++) {
     const lineNo = i + 1;
     const line = lines[i].trim();
@@ -77,7 +135,7 @@ export function parseBulkGlossaryPayload(raw: string): BulkImportParseResult {
     if (!line) continue;
 
     // Skip comments
-    if (line.startsWith("#")) continue;
+    if (line.startsWith("#") || line.startsWith("//")) continue;
 
     // Section header
     const sectionMatch = /^\[(\w+)\]$/.exec(line);
@@ -95,59 +153,22 @@ export function parseBulkGlossaryPayload(raw: string): BulkImportParseResult {
       continue;
     }
 
-    // Content outside any section
-    if (!currentSection) {
-      errors.push({
-        lineNo,
-        content: line,
-        reason: "Строка находится вне секции. Начните с [characters], [skills] или [terms]",
-      });
+    const normalizedLine = line.replace(BULLET_PREFIX_REGEX, "").trim();
+    if (!normalizedLine) {
       continue;
     }
 
     if (currentSection === "characters" || currentSection === "skills") {
-      const sourceTerm = line;
-      const key = sourceTerm.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      entries.push({ sourceTerm, mode: "preserve", targetTerm: null });
+      parseAsPreserve(normalizedLine, lineNo, line);
+    } else if (currentSection === "terms") {
+      parseAsFixed(normalizedLine, lineNo, line);
     } else {
-      // terms section: source = target
-      const eqIdx = line.indexOf("=");
-      if (eqIdx === -1) {
-        errors.push({
-          lineNo,
-          content: line,
-          reason: "Отсутствует знак = (ожидается формат: source = target)",
-        });
-        continue;
+      // Practical mode: sections are optional.
+      if (normalizedLine.includes("=") || normalizedLine.includes("=>")) {
+        parseAsFixed(normalizedLine, lineNo, line);
+      } else {
+        parseAsPreserve(normalizedLine, lineNo, line);
       }
-
-      const sourceTerm = line.slice(0, eqIdx).trim();
-      const targetTerm = line.slice(eqIdx + 1).trim();
-
-      if (!sourceTerm) {
-        errors.push({
-          lineNo,
-          content: line,
-          reason: "source_term пустой (левая часть от =)",
-        });
-        continue;
-      }
-
-      if (!targetTerm) {
-        errors.push({
-          lineNo,
-          content: line,
-          reason: "target_term пустой (правая часть от =)",
-        });
-        continue;
-      }
-
-      const key = sourceTerm.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      entries.push({ sourceTerm, mode: "fixed", targetTerm });
     }
   }
 

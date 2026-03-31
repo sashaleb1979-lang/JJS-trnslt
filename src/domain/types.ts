@@ -338,6 +338,7 @@ export interface TranslationBatchItem {
   text: string;
   tokenMap: Map<string, string>;
   protectedTokens: string[];
+  localGlossaryMatchCount?: number;
 }
 
 export interface TranslationRequestPlan {

@@ -210,6 +210,15 @@ const migrations: Array<{ id: string; sql: string }> = [
       );
     `,
   },
+  {
+    id: "002_glossary_partial_unique_index",
+    sql: `
+      DROP INDEX IF EXISTS idx_glossary_rules_unique_active;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_glossary_rules_unique_active
+        ON glossary_rules(guild_id, source_lang, target_lang, source_term)
+        WHERE status = 'active';
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

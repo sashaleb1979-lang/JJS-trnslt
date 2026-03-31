@@ -825,13 +825,13 @@ export class CommandRouter {
 
   private async showPanelGlossaryImportModal(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
     const mapping = this.requireSelectedMapping(session);
-    const customId = `glossary_import|${mapping.source_lang}|${mapping.target_lang}|false|false`;
+    const customId = `glossary_import|${mapping.source_lang}|${mapping.target_lang}|false|true`;
     const modal = new ModalBuilder().setCustomId(customId).setTitle("Массовый импорт Glossary");
     const payloadInput = new TextInputBuilder()
       .setCustomId("payload")
       .setLabel("Вставьте glossary payload")
       .setStyle(TextInputStyle.Paragraph)
-      .setPlaceholder("[characters]\nGojo\nSukuna\n\n[skills]\nBlack Flash\n\n[terms]\nawakening = пробуждение")
+      .setPlaceholder("Можно без секций:\nragdoll = опрокид\ncombo extender = продление комбо\nGojo")
       .setRequired(true)
       .setMaxLength(4000);
     modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(payloadInput));
@@ -848,24 +848,22 @@ export class CommandRouter {
   private async handlePanelGlossaryClearPair(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
     await interaction.deferUpdate();
     const mapping = this.requireSelectedMapping(session);
-    const archived = this.repositories.glossaryRules.archiveAllByPair(
-      session.guildId, mapping.source_lang, mapping.target_lang, interaction.user.id,
-    );
-    if (archived > 0) {
+    const deleted = this.repositories.glossaryRules.deleteAllByPair(session.guildId, mapping.source_lang, mapping.target_lang);
+    if (deleted > 0) {
       this.repositories.channelMappings.updateActiveGlossaryForPair(session.guildId, mapping.source_lang, mapping.target_lang, null);
     }
     await this.refreshDeferredPanel(
       interaction, session,
-      archived > 0
-        ? `Glossary ${mapping.source_lang} -> ${mapping.target_lang} очищен: ${archived} правил(о) архивировано.`
+      deleted > 0
+        ? `Glossary ${mapping.source_lang} -> ${mapping.target_lang} очищен: удалено ${deleted} правил(о).`
         : `Активных glossary правил для ${mapping.source_lang} -> ${mapping.target_lang} не найдено.`,
     );
   }
 
   private async handlePanelGlossaryClearAll(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
     await interaction.deferUpdate();
-    const archived = this.repositories.glossaryRules.archiveAllByGuild(session.guildId, interaction.user.id);
-    if (archived > 0) {
+    const deleted = this.repositories.glossaryRules.deleteAllByGuild(session.guildId);
+    if (deleted > 0) {
       const allMappings = this.repositories.channelMappings.listByGuildId(session.guildId);
       for (const m of allMappings) {
         this.repositories.channelMappings.updateActiveGlossaryForPair(session.guildId, m.source_lang, m.target_lang, null);
@@ -873,8 +871,8 @@ export class CommandRouter {
     }
     await this.refreshDeferredPanel(
       interaction, session,
-      archived > 0
-        ? `Весь glossary сервера очищен: ${archived} правил(о) архивировано.`
+      deleted > 0
+        ? `Весь glossary сервера очищен: удалено ${deleted} правил(о).`
         : "Активных glossary правил на сервере не найдено.",
     );
   }
@@ -1215,10 +1213,24 @@ export class CommandRouter {
           notes: null,
           userId: interaction.user.id,
         });
-        const synced = await this.glossaryManager.syncRulesForPair({ guildId, sourceLang, targetLang });
-        this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, synced.glossary_version_id);
+        let syncedVersionId: string | null = null;
+        let localOnly = false;
+        try {
+          const synced = await this.glossaryManager.syncRulesForPair({ guildId, sourceLang, targetLang });
+          this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, synced.glossary_version_id);
+          syncedVersionId = synced.glossary_version_id;
+        } catch (error) {
+          if (error instanceof AppError && error.code === "DEEPL_GLOSSARY_CREATE_FAILED") {
+            this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, null);
+            localOnly = true;
+          } else {
+            throw error;
+          }
+        }
         await interaction.reply({
-          content: `Glossary правило добавлено. Активна версия ${synced.glossary_version_id} (${sourceLang} -> ${targetLang}).`,
+          content: localOnly
+            ? `Glossary правило добавлено. DeepL glossary не активирован, но правило сохранено локально и будет применяться при переводе (${sourceLang} -> ${targetLang}).`
+            : `Glossary правило добавлено. Активна версия ${syncedVersionId} (${sourceLang} -> ${targetLang}).`,
           flags: MessageFlags.Ephemeral,
         });
         break;
@@ -1226,7 +1238,7 @@ export class CommandRouter {
 
       case "remove": {
         const sourceTerm = interaction.options.getString("source_term", true).trim();
-        const removed = this.repositories.glossaryRules.archiveRule(guildId, sourceLang, targetLang, sourceTerm, interaction.user.id);
+        const removed = this.repositories.glossaryRules.deleteRule(guildId, sourceLang, targetLang, sourceTerm);
         if (!removed) {
           throw new AppError({ code: "GLOSSARY_RULE_NOT_FOUND", message: "Active glossary правило не найдено.", failureClass: "validation" });
         }
@@ -1241,10 +1253,24 @@ export class CommandRouter {
           return;
         }
 
-        const synced = await this.glossaryManager.syncRulesForPair({ guildId, sourceLang, targetLang });
-        this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, synced.glossary_version_id);
+        let syncedVersionId: string | null = null;
+        let localOnly = false;
+        try {
+          const synced = await this.glossaryManager.syncRulesForPair({ guildId, sourceLang, targetLang });
+          this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, synced.glossary_version_id);
+          syncedVersionId = synced.glossary_version_id;
+        } catch (error) {
+          if (error instanceof AppError && error.code === "DEEPL_GLOSSARY_CREATE_FAILED") {
+            this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, null);
+            localOnly = true;
+          } else {
+            throw error;
+          }
+        }
         await interaction.reply({
-          content: `Правило удалено. Активирована версия ${synced.glossary_version_id}.`,
+          content: localOnly
+            ? "Правило удалено. DeepL glossary не активирован, оставшиеся правила будут применяться локально при переводе."
+            : `Правило удалено. Активирована версия ${syncedVersionId}.`,
           flags: MessageFlags.Ephemeral,
         });
         break;
@@ -1252,7 +1278,7 @@ export class CommandRouter {
 
       case "list": {
         const query = interaction.options.getString("query") ?? undefined;
-        const rules = this.repositories.glossaryRules.listByGuild(guildId, query).slice(0, 20);
+        const rules = this.repositories.glossaryRules.listByGuild(guildId, query, false).slice(0, 50);
         const lines = rules.map((rule) => `- [${rule.status}] ${rule.source_lang}->${rule.target_lang} ${rule.source_term} => ${rule.rule_type === "preserve" ? "(preserve)" : (rule.target_term ?? "")}`);
         await interaction.reply({
           content: lines.length > 0 ? lines.join("\n").slice(0, 1_950) : "Glossary правил пока нет.",
@@ -1284,7 +1310,7 @@ export class CommandRouter {
       case "import": {
         const attachment = interaction.options.getAttachment("file");
         const dryRun = interaction.options.getBoolean("dry_run") ?? false;
-        const replaceExisting = interaction.options.getBoolean("replace_existing") ?? false;
+        const replaceExisting = interaction.options.getBoolean("replace_existing") ?? true;
         if (attachment) {
           await interaction.deferReply({ flags: MessageFlags.Ephemeral });
           const payload = await this.downloadGlossaryAttachment(attachment);
@@ -1309,9 +1335,7 @@ export class CommandRouter {
           .setCustomId("payload")
           .setLabel("Вставьте glossary payload")
           .setStyle(TextInputStyle.Paragraph)
-          .setPlaceholder(
-            "[characters]\nGojo\nSukuna\n\n[skills]\nBlack Flash\n\n[terms]\nawakening = Awakening (пробуждение)",
-          )
+          .setPlaceholder("Можно без секций:\nragdoll = опрокид\ncombo extender = продление комбо\nGojo")
           .setRequired(true)
           .setMaxLength(4000);
         modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(payloadInput));
@@ -1322,8 +1346,8 @@ export class CommandRouter {
       case "clear": {
         const clearAll = interaction.options.getBoolean("all") ?? false;
         if (clearAll) {
-          const archived = this.repositories.glossaryRules.archiveAllByGuild(guildId, interaction.user.id);
-          if (archived === 0) {
+          const deleted = this.repositories.glossaryRules.deleteAllByGuild(guildId);
+          if (deleted === 0) {
             await interaction.reply({ content: "Активных glossary правил на сервере не найдено.", flags: MessageFlags.Ephemeral });
             return;
           }
@@ -1332,18 +1356,18 @@ export class CommandRouter {
             this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, m.source_lang, m.target_lang, null);
           }
           await interaction.reply({
-            content: `Glossary полностью очищен: ${archived} правил(о) архивировано. Active glossary версия сброшена для всех mapping.`,
+            content: `Glossary полностью очищен: удалено ${deleted} правил(о). Active glossary версия сброшена для всех связок каналов.`,
             flags: MessageFlags.Ephemeral,
           });
         } else {
-          const archived = this.repositories.glossaryRules.archiveAllByPair(guildId, sourceLang, targetLang, interaction.user.id);
-          if (archived === 0) {
+          const deleted = this.repositories.glossaryRules.deleteAllByPair(guildId, sourceLang, targetLang);
+          if (deleted === 0) {
             await interaction.reply({ content: `Активных glossary правил для ${sourceLang} -> ${targetLang} не найдено.`, flags: MessageFlags.Ephemeral });
             return;
           }
           this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, null);
           await interaction.reply({
-            content: `Glossary ${sourceLang} -> ${targetLang} очищен: ${archived} правил(о) архивировано. Active glossary версия сброшена.`,
+            content: `Glossary ${sourceLang} -> ${targetLang} очищен: удалено ${deleted} правил(о). Active glossary версия сброшена.`,
             flags: MessageFlags.Ephemeral,
           });
         }
@@ -1400,10 +1424,10 @@ export class CommandRouter {
   }
 
   private async downloadGlossaryAttachment(attachment: Attachment): Promise<string> {
-    if (attachment.size > 128_000) {
+    if (attachment.size > 5 * 1024 * 1024) {
       throw new AppError({
         code: "GLOSSARY_ATTACHMENT_TOO_LARGE",
-        message: "Файл glossary слишком большой. Используйте файл до 128 KB.",
+        message: "Файл glossary слишком большой. Используйте файл до 5 MB.",
         failureClass: "validation",
       });
     }
@@ -1434,11 +1458,14 @@ export class CommandRouter {
     parsed: number;
     added: number;
     updated: number;
-    skipped: number;
+    unchanged: number;
+    conflictsSkipped: number;
     errors: number;
     parseWarnings: string;
     activeVersionId: string | null;
     dryRun: boolean;
+    localOnly: boolean;
+    syncWarning: string | null;
   }> {
     this.logger.info(
       {
@@ -1482,7 +1509,10 @@ export class CommandRouter {
 
     let added = 0;
     let updated = 0;
-    let skipped = 0;
+    let unchanged = 0;
+    let conflictsSkipped = 0;
+    let localOnly = false;
+    let syncWarning: string | null = null;
 
     if (input.dryRun) {
       for (const entry of entries) {
@@ -1490,11 +1520,11 @@ export class CommandRouter {
         if (!existing) {
           added++;
         } else if (existing.rule_type === entry.mode && existing.target_term === entry.targetTerm) {
-          skipped++;
+          unchanged++;
         } else if (input.replaceExisting) {
           updated++;
         } else {
-          skipped++;
+          conflictsSkipped++;
         }
       }
     } else {
@@ -1508,18 +1538,29 @@ export class CommandRouter {
       });
       added = dbResult.added;
       updated = dbResult.updated;
-      skipped = dbResult.skipped;
+      unchanged = dbResult.unchanged;
+      conflictsSkipped = dbResult.conflictsSkipped;
     }
 
     let activeVersionId = this.repositories.glossaryVersions.getActiveByPair(input.guildId, input.sourceLang, input.targetLang)?.glossary_version_id ?? null;
     if (!input.dryRun && (added > 0 || updated > 0)) {
-      const synced = await this.glossaryManager.syncRulesForPair({
-        guildId: input.guildId,
-        sourceLang: input.sourceLang,
-        targetLang: input.targetLang,
-      });
-      this.repositories.channelMappings.updateActiveGlossaryForPair(input.guildId, input.sourceLang, input.targetLang, synced.glossary_version_id);
-      activeVersionId = synced.glossary_version_id;
+      try {
+        const synced = await this.glossaryManager.syncRulesForPair({
+          guildId: input.guildId,
+          sourceLang: input.sourceLang,
+          targetLang: input.targetLang,
+        });
+        this.repositories.channelMappings.updateActiveGlossaryForPair(input.guildId, input.sourceLang, input.targetLang, synced.glossary_version_id);
+        activeVersionId = synced.glossary_version_id;
+      } catch (error) {
+        if (error instanceof AppError && error.code === "DEEPL_GLOSSARY_CREATE_FAILED") {
+          localOnly = true;
+          syncWarning = "DeepL glossary не активирован. Правила сохранены локально и всё равно будут применяться при переводе.";
+          this.repositories.channelMappings.updateActiveGlossaryForPair(input.guildId, input.sourceLang, input.targetLang, null);
+        } else {
+          throw error;
+        }
+      }
     }
 
     return {
@@ -1528,11 +1569,14 @@ export class CommandRouter {
       parsed: entries.length,
       added,
       updated,
-      skipped,
+      unchanged,
+      conflictsSkipped,
       errors: parseErrors.length,
       parseWarnings: parseErrors.length > 0 ? formatParseErrors(parseErrors, 5) : "",
       activeVersionId,
       dryRun: input.dryRun,
+      localOnly,
+      syncWarning,
     };
   }
 
@@ -1542,22 +1586,31 @@ export class CommandRouter {
     parsed: number;
     added: number;
     updated: number;
-    skipped: number;
+    unchanged: number;
+    conflictsSkipped: number;
     errors: number;
     parseWarnings: string;
     activeVersionId: string | null;
     dryRun: boolean;
+    localOnly: boolean;
+    syncWarning: string | null;
   }): string {
+    const noChanges = result.added === 0 && result.updated === 0 && result.conflictsSkipped === 0;
     const lines = [
-      result.dryRun ? "**Dry-run glossary import OK.**" : "**Импорт glossary завершён.**",
+      result.dryRun ? "**Dry-run glossary import OK.**" : (noChanges ? "**Импорт glossary: изменений не было.**" : "**Импорт glossary завершён.**"),
       `Pair: ${result.sourceLang} -> ${result.targetLang}`,
       `Parsed: ${result.parsed}`,
       result.dryRun ? `Would add: ${result.added}` : `Added: ${result.added}`,
       result.dryRun ? `Would update: ${result.updated}` : `Updated: ${result.updated}`,
-      `Skipped: ${result.skipped}`,
+      `Unchanged: ${result.unchanged}`,
+      `Conflicts skipped: ${result.conflictsSkipped}`,
       `Warnings: ${result.errors}`,
+      `Glossary mode: ${result.localOnly ? "local-only" : "deepl+local"}`,
       `Active glossary version: ${result.activeVersionId ?? "none"}`,
     ];
+    if (result.syncWarning) {
+      lines.push("", result.syncWarning);
+    }
     if (result.parseWarnings) {
       lines.push("", `Parse warnings:\n${result.parseWarnings}`);
     }
