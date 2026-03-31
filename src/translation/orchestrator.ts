@@ -16,6 +16,7 @@ import { TranslationSegmenter } from "./segmenter";
 // Error codes from GlossaryManager that indicate no usable glossary is available.
 // When any of these are thrown, translation continues without a glossary.
 const GLOSSARY_UNAVAILABLE_CODES = new Set(["GLOSSARY_NOT_CONFIGURED", "GLOSSARY_NOT_READY", "GLOSSARY_PAIR_UNSUPPORTED"]);
+const BLOCK_VALIDATION_FALLBACK_CODES = new Set(["TRANSLATION_TOKEN_MISMATCH", "TRANSLATION_NUMERIC_MISMATCH"]);
 
 export interface OrchestrationResult {
   type: "published" | "duplicate" | "skipped";
@@ -192,6 +193,34 @@ export class TranslationOrchestrator {
       }
     }
 
+    try {
+      return await this.executeTranslation(payload, mapping, glossaryId, glossaryVersionId);
+    } catch (error) {
+      if (glossaryId && isGlossaryTranslationFailure(error)) {
+        this.logger.warn(
+          {
+            event: "glossary_translate_failed_retrying_without",
+            mapping_id: mapping.mapping_id,
+            raw_message_id: payload.raw_message.message_id,
+            glossary_id: glossaryId,
+            error_code: error.code,
+            error_message: error.message,
+            error_details: error.details,
+          },
+          "Translation failed because glossary is unavailable; retrying without glossary",
+        );
+        return await this.executeTranslation(payload, mapping, undefined, undefined);
+      }
+      throw error;
+    }
+  }
+
+  private async executeTranslation(
+    payload: PostPayload,
+    mapping: ChannelMappingRow,
+    glossaryId: string | undefined,
+    glossaryVersionId: string | undefined,
+  ): Promise<TranslationResult> {
     const plans = this.segmenter.buildPlans({
       textBlocks: payload.text_blocks,
       sourceLang: mapping.source_lang,
@@ -237,11 +266,7 @@ export class TranslationOrchestrator {
 
       response.translations.forEach((translation, index) => {
         const item = plan.items[index];
-        const restored = this.validator.validateAndRestore({
-          originalText: item.originalText,
-          translatedText: translation.text,
-          tokenMap: item.tokenMap,
-        });
+        const restored = this.validateTranslatedBlock(item, translation.text, payload, mapping, glossaryId);
         this.storeTranslatedBlock(translatedBlocks, item.blockId, restored);
         billedCharacters += translation.billed_characters ?? item.originalText.length;
         detectedSourceLanguage = detectedSourceLanguage ?? translation.detected_source_language ?? null;
@@ -255,6 +280,41 @@ export class TranslationOrchestrator {
       billedCharacters,
       detectedSourceLanguage,
     };
+  }
+
+  private validateTranslatedBlock(
+    item: { blockId: string; originalText: string; tokenMap: Map<string, string> },
+    translatedText: string,
+    payload: PostPayload,
+    mapping: ChannelMappingRow,
+    glossaryId: string | undefined,
+  ): string {
+    try {
+      return this.validator.validateAndRestore({
+        originalText: item.originalText,
+        translatedText,
+        tokenMap: item.tokenMap,
+      });
+    } catch (error) {
+      if (isAppError(error) && BLOCK_VALIDATION_FALLBACK_CODES.has(error.code)) {
+        this.logger.warn(
+          {
+            event: "translation_block_validation_fallback",
+            mapping_id: mapping.mapping_id,
+            raw_message_id: payload.raw_message.message_id,
+            block_id: item.blockId,
+            has_glossary: Boolean(glossaryId),
+            error_code: error.code,
+            error_message: error.message,
+            error_details: error.details,
+          },
+          "Translation block failed validation; using original block text",
+        );
+        return item.originalText;
+      }
+
+      throw error;
+    }
   }
 
   private async publishAndPersist(
@@ -316,4 +376,19 @@ export class TranslationOrchestrator {
     ].filter(Boolean);
     return parts.join("\n");
   }
+}
+
+function isGlossaryTranslationFailure(error: unknown): error is AppError {
+  if (!isAppError(error) || error.code !== "DEEPL_TRANSLATE_FAILED") {
+    return false;
+  }
+
+  const status = typeof error.details?.status === "number" ? error.details.status : undefined;
+  const body = typeof error.details?.body === "string" ? error.details.body.toLowerCase() : "";
+
+  if (status !== 400 && status !== 404) {
+    return false;
+  }
+
+  return body.includes("glossary");
 }

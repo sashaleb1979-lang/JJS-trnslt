@@ -17,16 +17,26 @@ export class TranslationResponseValidator {
     if (translatedTokenCount < tokenMap.size) {
       throw new AppError({
         code: "TRANSLATION_TOKEN_MISMATCH",
-        message: "Protected token count dropped after translation",
-        retryable: true,
+        message: `Protected token count dropped after translation (expected ${tokenMap.size}, got ${translatedTokenCount})`,
+        retryable: false,
+        details: {
+          expectedTokenCount: tokenMap.size,
+          actualTokenCount: translatedTokenCount,
+        },
       });
     }
 
-    if (countNumericTokens(translatedText) + 3 < countNumericTokens(originalText)) {
+    const originalNumerics = countNumericTokens(originalText);
+    const translatedNumerics = countNumericTokens(translatedText);
+    if (originalNumerics > 0 && translatedNumerics < originalNumerics * 0.4) {
       throw new AppError({
         code: "TRANSLATION_NUMERIC_MISMATCH",
-        message: "Numeric tokens were lost during translation",
-        retryable: true,
+        message: `Too many numeric tokens were lost during translation (original: ${originalNumerics}, translated: ${translatedNumerics})`,
+        retryable: false,
+        details: {
+          originalNumerics,
+          translatedNumerics,
+        },
       });
     }
 
