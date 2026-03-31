@@ -20,6 +20,8 @@
 
 Opens a Discord modal with a large textarea. Paste your full glossary payload and submit.
 
+Это не file upload. Импорт сейчас работает через вставку текстового блока в модалку из `/glossary import` или из кнопки `Импорт glossary` в `/panel`.
+
 **Options (set before the modal opens):**
 
 | Option | Default | Description |
@@ -104,3 +106,39 @@ cooldown = Cooldown (откат)
 - Validation errors are shown before any DB changes are made.
 - If `replace_existing=false` (default) and a rule already exists with different values, the new rule is **skipped** (not an error).
 - If `replace_existing=true`, the existing rule is archived and the new version is added.
+
+## Quick examples
+
+### Preserve names and skills
+
+```text
+[characters]
+Gojo
+Sukuna
+
+[skills]
+Black Flash
+Root Swarm
+```
+
+### Fixed term translations
+
+```text
+[terms]
+awakening = пробуждение
+guard break = слом блока
+cooldown = откат
+```
+
+### Mixed payload
+
+```text
+[characters]
+Gojo
+
+[skills]
+Black Flash
+
+[terms]
+awakening = пробуждение
+```

@@ -6,6 +6,7 @@
 - Enable the `MESSAGE_CONTENT` privileged intent
 - Start the service and run `/panel` in Discord for day-to-day administration (or `/setup` if you prefer the legacy flow)
 - See [docs/discord-panel.md](docs/discord-panel.md) for the full panel guide and queue restart flow
+- For glossary import use `/panel` -> `Импорт glossary` or `/glossary import`; both open a text modal, not a file picker
 
 ## Raw intake channel behavior
 

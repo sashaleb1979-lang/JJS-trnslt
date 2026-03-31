@@ -30,13 +30,25 @@ export class DeepLClient {
       return [{ source_lang: "EN", target_lang: "RU" }];
     }
 
-    const response = await this.request("/v2/glossary-language-pairs", { method: "GET" });
-    if (!response.ok) {
-      throw await this.toAppError(response, "DEEPL_GLOSSARY_PAIR_FETCH_FAILED", false);
+    for (const path of ["/v3/glossary-language-pairs", "/v2/glossary-language-pairs"]) {
+      const response = await this.request(path, { method: "GET" });
+      if (!response.ok) {
+        if (path === "/v3/glossary-language-pairs" && response.status === 404) {
+          continue;
+        }
+        throw await this.toAppError(response, "DEEPL_GLOSSARY_PAIR_FETCH_FAILED", false);
+      }
+
+      const data = (await response.json()) as {
+        supported_languages?: DeepLSupportedGlossaryPair[];
+        glossary_language_pairs?: DeepLSupportedGlossaryPair[];
+        supported_glossary_language_pairs?: DeepLSupportedGlossaryPair[];
+      };
+
+      return data.supported_languages ?? data.glossary_language_pairs ?? data.supported_glossary_language_pairs ?? [];
     }
 
-    const data = (await response.json()) as { supported_languages?: DeepLSupportedGlossaryPair[] };
-    return data.supported_languages ?? [];
+    return [];
   }
 
   async translate(plan: TranslationRequestPlan): Promise<DeepLTranslateResponse> {
