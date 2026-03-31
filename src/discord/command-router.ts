@@ -98,6 +98,9 @@ export class CommandRouter {
         case "panel":
           await this.handlePanel(interaction);
           break;
+        case "memory":
+          await this.handleMemory(interaction);
+          break;
         case "setup":
           await this.handleSetup(interaction, member);
           break;
@@ -213,6 +216,9 @@ export class CommandRouter {
           break;
         case "glossary-clear-all":
           await this.handlePanelGlossaryClearAll(interaction as ButtonInteraction, session);
+          break;
+        case "memory-clear-mapping":
+          await this.handlePanelMemoryClearMapping(interaction as ButtonInteraction, session);
           break;
         default:
           await interaction.reply({ content: "Неизвестное действие панели.", flags: MessageFlags.Ephemeral });
@@ -332,6 +338,22 @@ export class CommandRouter {
       new SlashCommandBuilder()
         .setName("panel")
         .setDescription("Открыть единую панель управления ботом"),
+      new SlashCommandBuilder()
+        .setName("memory")
+        .setDescription("Сбросить память бота о уже обработанных raw сообщениях")
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("clear")
+            .setDescription("Очистить память для одного сообщения, одной связки или всего сервера")
+            .addStringOption((option) => option.setName("message_id").setDescription("Raw message ID для точечной очистки"))
+            .addBooleanOption((option) => option.setName("all").setDescription("Очистить всю память сервера"))
+            .addChannelOption((option) =>
+              option
+                .setName("raw_channel")
+                .setDescription("Очистить память только для одной связки по raw-каналу")
+                .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+            ),
+        ),
       new SlashCommandBuilder()
         .setName("setup")
         .setDescription("Создать или обновить связку raw-канала и выходного канала")
@@ -567,7 +589,15 @@ export class CommandRouter {
         .setStyle(ButtonStyle.Danger),
     );
 
-    return [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(mappingMenu), buttons, glossaryButtons];
+    const maintenanceButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:memory-clear-mapping:${this.findPanelSessionId(session)}`)
+        .setLabel("Сбросить память связки")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(!selectedMapping),
+    );
+
+    return [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(mappingMenu), buttons, glossaryButtons, maintenanceButtons];
   }
 
   private buildSetupPanelComponents(session: PanelSession) {
@@ -877,6 +907,34 @@ export class CommandRouter {
     );
   }
 
+  private async handlePanelMemoryClearMapping(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    await interaction.deferUpdate();
+    const mapping = this.requireSelectedMapping(session);
+    const deleted = this.repositories.processedRawMessages.deleteByMappingId(mapping.mapping_id);
+
+    this.repositories.auditLog.insert({
+      guildId: session.guildId,
+      actorType: "user",
+      actorId: interaction.user.id,
+      action: "clear_processed_memory",
+      subjectType: "mapping",
+      subjectId: mapping.mapping_id,
+      details: {
+        rawChannelId: mapping.raw_channel_id,
+        outputChannelId: mapping.output_channel_id,
+        deletedCount: deleted,
+      },
+    });
+
+    await this.refreshDeferredPanel(
+      interaction,
+      session,
+      deleted > 0
+        ? `Память связки очищена: удалено ${deleted} обработанных raw сообщений.`
+        : "Память связки уже была пустой.",
+    );
+  }
+
   private requireSelectedMapping(session: PanelSession): ChannelMappingRow {
     const mapping = session.selectedMappingId ? this.repositories.channelMappings.getByMappingId(session.selectedMappingId) : null;
     if (!mapping) {
@@ -1182,6 +1240,86 @@ export class CommandRouter {
     await this.scheduleRetranslate(rawMessageId);
 
     await interaction.reply({ content: `Повторный перевод запланирован для raw message ${rawMessageId}.`, flags: MessageFlags.Ephemeral });
+  }
+
+  private async handleMemory(interaction: ChatInputCommandInteraction): Promise<void> {
+    const subcommand = interaction.options.getSubcommand();
+    if (subcommand !== "clear") {
+      throw new AppError({ code: "UNKNOWN_MEMORY_SUBCOMMAND", message: "Неизвестная подкоманда memory.", failureClass: "validation" });
+    }
+
+    const guildId = interaction.guildId!;
+    const messageId = interaction.options.getString("message_id");
+    const clearAll = interaction.options.getBoolean("all") ?? false;
+    const rawChannel = ensureTextChannel(interaction.options.getChannel("raw_channel", false));
+    const providedSelectors = [Boolean(messageId), Boolean(clearAll), Boolean(rawChannel)].filter(Boolean).length;
+
+    if (providedSelectors === 0) {
+      throw new AppError({
+        code: "MEMORY_CLEAR_TARGET_REQUIRED",
+        message: "Укажите один вариант очистки: message_id, raw_channel или all:true.",
+        failureClass: "validation",
+      });
+    }
+
+    if (providedSelectors > 1) {
+      throw new AppError({
+        code: "MEMORY_CLEAR_TARGET_AMBIGUOUS",
+        message: "Используйте только один вариант очистки: message_id, raw_channel или all:true.",
+        failureClass: "validation",
+      });
+    }
+
+    let deleted = 0;
+    let summary = "";
+    let subjectType = "guild";
+    let subjectId = guildId;
+    let details: Record<string, string | number | null> = {};
+
+    if (messageId) {
+      deleted = this.repositories.processedRawMessages.deleteByRawMessageId(messageId);
+      summary = deleted > 0
+        ? `Память очищена для raw message ${messageId}. Удалено ${deleted} записей.`
+        : `Raw message ${messageId} в памяти не найден.`;
+      subjectType = "raw_message";
+      subjectId = messageId;
+      details = { rawMessageId: messageId, deletedCount: deleted };
+    } else if (rawChannel) {
+      const mapping = this.resolveSingleMapping(guildId, rawChannel.id);
+      deleted = this.repositories.processedRawMessages.deleteByMappingId(mapping.mapping_id);
+      summary = deleted > 0
+        ? `Память очищена для связки <#${mapping.raw_channel_id}> -> <#${mapping.output_channel_id}>. Удалено ${deleted} записей.`
+        : `Для связки <#${mapping.raw_channel_id}> память уже пустая.`;
+      subjectType = "mapping";
+      subjectId = mapping.mapping_id;
+      details = {
+        mappingId: mapping.mapping_id,
+        rawChannelId: mapping.raw_channel_id,
+        outputChannelId: mapping.output_channel_id,
+        deletedCount: deleted,
+      };
+    } else {
+      deleted = this.repositories.processedRawMessages.deleteByGuildId(guildId);
+      summary = deleted > 0
+        ? `Память сервера очищена. Удалено ${deleted} обработанных raw сообщений.`
+        : "Память сервера уже была пустой.";
+      details = { deletedCount: deleted };
+    }
+
+    this.repositories.auditLog.insert({
+      guildId,
+      actorType: "user",
+      actorId: interaction.user.id,
+      action: "clear_processed_memory",
+      subjectType,
+      subjectId,
+      details,
+    });
+
+    await interaction.reply({
+      content: `${summary}\nПримечание: публикации в output-каналах не удаляются, стирается только память бота о том, что эти raw сообщения уже были обработаны.`,
+      flags: MessageFlags.Ephemeral,
+    });
   }
 
   private async handleGlossary(interaction: ChatInputCommandInteraction): Promise<void> {

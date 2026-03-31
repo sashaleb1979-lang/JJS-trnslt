@@ -4,6 +4,21 @@ import { PostPayload, ProcessedRawMessageRow } from "../../domain/types";
 export class ProcessedRawMessagesRepository {
   constructor(private readonly db: Database.Database) {}
 
+  deleteByRawMessageId(rawMessageId: string): number {
+    const result = this.db.prepare("DELETE FROM processed_raw_messages WHERE raw_message_id = ?").run(rawMessageId);
+    return result.changes;
+  }
+
+  deleteByMappingId(mappingId: string): number {
+    const result = this.db.prepare("DELETE FROM processed_raw_messages WHERE mapping_id = ?").run(mappingId);
+    return result.changes;
+  }
+
+  deleteByGuildId(guildId: string): number {
+    const result = this.db.prepare("DELETE FROM processed_raw_messages WHERE guild_id = ?").run(guildId);
+    return result.changes;
+  }
+
   exists(rawMessageId: string): boolean {
     const row = this.db.prepare("SELECT 1 AS found FROM processed_raw_messages WHERE raw_message_id = ?").get(rawMessageId) as
       | { found: number }
