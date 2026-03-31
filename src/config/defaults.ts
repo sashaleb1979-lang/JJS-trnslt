@@ -1,5 +1,6 @@
 export const DEFAULTS = {
-  deeplApiBaseUrl: "https://api.deepl.com",
+  // Free endpoint is the safe default for the current deployment.
+  deeplApiBaseUrl: "https://api-free.deepl.com",
   defaultSourceLanguage: "EN",
   defaultTargetLanguage: "RU",
   logLevel: "info",

@@ -4,6 +4,7 @@ import { chunkForDiscordContent, fitEmbedDescription } from "./chunker";
 import { PreparedMedia } from "./attachment-handler";
 
 export class PublishRenderer {
+  // Renderer footer distinguishes translated, skipped, and fallback publication paths.
   buildPlan(input: {
     payload: PostPayload;
     mapping: ChannelMappingRow;

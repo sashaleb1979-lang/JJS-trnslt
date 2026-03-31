@@ -9,6 +9,7 @@ import { PollingScheduler } from "./scheduler";
 
 export class JobWorker {
   private readonly scheduler = new PollingScheduler();
+  // activeJobs tracks in-flight work to respect maxConcurrentJobs without extra locking.
   private running = false;
   private activeJobs = 0;
 

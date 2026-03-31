@@ -3,6 +3,7 @@ import { countNumericTokens } from "../utils/text";
 import { restoreProtectedText } from "./token-protector";
 
 export class TranslationResponseValidator {
+  // These checks are conservative and only guard against obviously broken responses.
   validateAndRestore(input: { originalText: string; translatedText: string; tokenMap: Map<string, string> }): string {
     const { originalText, translatedText, tokenMap } = input;
     if (!translatedText.trim()) {

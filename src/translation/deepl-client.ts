@@ -14,6 +14,7 @@ interface DeepLTranslateRequest {
 export class DeepLClient {
   constructor(private readonly config: AppConfig) {}
 
+  // Startup auth check uses usage because it is cheap and does not bill translation quota.
   async validateAuth(): Promise<void> {
     if (this.config.mockDeepl) {
       return;

@@ -16,6 +16,7 @@ import { TranslationSegmenter } from "./segmenter";
 // Error codes from GlossaryManager that indicate no usable glossary is available.
 // When any of these are thrown, translation continues without a glossary.
 const GLOSSARY_UNAVAILABLE_CODES = new Set(["GLOSSARY_NOT_CONFIGURED", "GLOSSARY_NOT_READY", "GLOSSARY_PAIR_UNSUPPORTED"]);
+// Validation fallback is intentionally scoped to a single block to avoid failing the whole message.
 const BLOCK_VALIDATION_FALLBACK_CODES = new Set(["TRANSLATION_TOKEN_MISMATCH", "TRANSLATION_NUMERIC_MISMATCH"]);
 
 export interface OrchestrationResult {

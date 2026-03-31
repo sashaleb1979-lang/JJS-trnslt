@@ -7,6 +7,7 @@ import { DeepLClient } from "./deepl-client";
 import { AppRepositories } from "../domain/types";
 
 export class GlossaryManager {
+  // Cache supported pairs to avoid repeated DeepL capability lookups.
   private supportedPairsCache: Set<string> | null = null;
 
   constructor(
