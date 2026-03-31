@@ -19,7 +19,7 @@ export class GatewayListener {
   ) {}
 
   register(): void {
-    this.client.on("ready", () => {
+    this.client.on("clientReady", () => {
       this.statusService.setGatewayState("connected");
       this.logger.info({ event: "discord_ready", user_id: this.client.user?.id }, "Discord client is ready");
     });

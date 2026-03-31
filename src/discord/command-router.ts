@@ -1,5 +1,6 @@
 import {
   ActionRowBuilder,
+  Attachment,
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
@@ -119,15 +120,18 @@ export class CommandRouter {
           await interaction.reply({ content: "Неизвестная команда.", flags: MessageFlags.Ephemeral });
       }
     } catch (error) {
+      const appError = error instanceof AppError ? error : null;
       this.logger.error(
         {
           event: "admin_command_failed",
           command: interaction.commandName,
+          error_code: appError?.code,
+          error_details: appError?.details,
           error: error instanceof Error ? error.message : String(error),
         },
-        "Admin command failed",
+        `Admin command failed (command=${interaction.commandName}, code=${appError?.code ?? "unknown"}): ${error instanceof Error ? error.message : String(error)}`,
       );
-      const message = error instanceof AppError ? error.message : "Команда завершилась ошибкой.";
+      const message = appError ? this.formatAppErrorForDiscord(appError) : "Команда завершилась ошибкой.";
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: message });
       } else {
@@ -214,15 +218,18 @@ export class CommandRouter {
           await interaction.reply({ content: "Неизвестное действие панели.", flags: MessageFlags.Ephemeral });
       }
     } catch (error) {
+      const appError = error instanceof AppError ? error : null;
       this.logger.error(
         {
           event: "panel_component_failed",
           custom_id: interaction.customId,
+          error_code: appError?.code,
+          error_details: appError?.details,
           error: error instanceof Error ? error.message : String(error),
         },
-        "Panel interaction failed",
+        `Panel interaction failed (custom_id=${interaction.customId}, code=${appError?.code ?? "unknown"}): ${error instanceof Error ? error.message : String(error)}`,
       );
-      const message = error instanceof AppError ? error.message : "Панель завершилась ошибкой.";
+      const message = appError ? this.formatAppErrorForDiscord(appError) : "Панель завершилась ошибкой.";
       if (interaction.deferred || interaction.replied) {
         await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral });
       } else {
@@ -232,13 +239,32 @@ export class CommandRouter {
   }
 
   async handleModalInteraction(interaction: ModalSubmitInteraction): Promise<void> {
-    if (interaction.customId.startsWith("glossary_import|")) {
-      await this.handleGlossaryImportModal(interaction);
-      return;
-    }
+    try {
+      if (interaction.customId.startsWith("glossary_import|")) {
+        await this.handleGlossaryImportModal(interaction);
+        return;
+      }
 
-    if (interaction.customId.startsWith(`${PANEL_PREFIX}:setup-modal:`)) {
-      await this.handlePanelSetupModal(interaction);
+      if (interaction.customId.startsWith(`${PANEL_PREFIX}:setup-modal:`)) {
+        await this.handlePanelSetupModal(interaction);
+      }
+    } catch (error) {
+      const appError = error instanceof AppError ? error : null;
+      this.logger.error(
+        {
+          event: "modal_interaction_failed",
+          custom_id: interaction.customId,
+          error_code: appError?.code,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        `Modal interaction failed (custom_id=${interaction.customId}, code=${appError?.code ?? "unknown"}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+      const message = appError?.message ?? "Форма завершилась ошибкой.";
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: message });
+      } else {
+        await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+      }
     }
   }
 
@@ -289,6 +315,7 @@ export class CommandRouter {
           .setDescription("Массовый импорт glossary из текстового блока (открывает форму ввода)")
           .addStringOption((option) => option.setName("source_lang").setDescription("Язык источника (по умолчанию из настроек)"))
           .addStringOption((option) => option.setName("target_lang").setDescription("Язык перевода (по умолчанию из настроек)"))
+          .addAttachmentOption((option) => option.setName("file").setDescription("TXT/MD файл с glossary payload; если не указан, откроется форма ввода"))
           .addBooleanOption((option) => option.setName("dry_run").setDescription("Только проверка, без записи в БД"))
           .addBooleanOption((option) => option.setName("replace_existing").setDescription("Заменять существующие правила при конфликте (по умолчанию false)")),
       )
@@ -307,7 +334,7 @@ export class CommandRouter {
         .setDescription("Открыть единую панель управления ботом"),
       new SlashCommandBuilder()
         .setName("setup")
-        .setDescription("Создать или обновить mapping raw channel -> output channel")
+        .setDescription("Создать или обновить связку raw-канала и выходного канала")
         .addChannelOption((option) =>
           option
             .setName("raw_channel")
@@ -344,7 +371,7 @@ export class CommandRouter {
         ),
       new SlashCommandBuilder()
         .setName("pause")
-        .setDescription("Поставить mapping на паузу")
+        .setDescription("Поставить связку каналов на паузу")
         .addBooleanOption((option) => option.setName("all").setDescription("Пауза для всех mappings сервера"))
         .addChannelOption((option) =>
           option
@@ -354,7 +381,7 @@ export class CommandRouter {
         ),
       new SlashCommandBuilder()
         .setName("resume")
-        .setDescription("Снять паузу с mapping")
+        .setDescription("Снять паузу со связки каналов")
         .addBooleanOption((option) => option.setName("all").setDescription("Resume для всех mappings сервера"))
         .addChannelOption((option) =>
           option
@@ -450,7 +477,7 @@ export class CommandRouter {
     const lines = [banner, "Панель управления переводчиком", statusLine, ""];
     if (session.view === "setup") {
       const selected = selectedMapping;
-      lines.push(selected ? `Редактирование: <#${selected.raw_channel_id}> -> <#${selected.output_channel_id}>` : "Создание нового mapping");
+      lines.push(selected ? `Редактирование связки: <#${selected.raw_channel_id}> -> <#${selected.output_channel_id}>` : "Создание новой связки каналов");
       lines.push(`Raw канал: ${session.setupRawChannelId ? `<#${session.setupRawChannelId}>` : "не выбран"}`);
       lines.push(`Output канал: ${session.setupOutputChannelId ? `<#${session.setupOutputChannelId}>` : "не выбран"}`);
       lines.push(`Log канал: ${session.setupLogChannelId ? `<#${session.setupLogChannelId}>` : "не задан"}`);
@@ -461,16 +488,16 @@ export class CommandRouter {
       const retry = this.repositories.translationJobs.countByMappingAndStatus(selectedMapping.mapping_id, "retry_wait");
       const failed = this.repositories.translationJobs.countByMappingAndStatus(selectedMapping.mapping_id, "failed");
       const latest = this.repositories.processedRawMessages.getLatestForMapping(selectedMapping.mapping_id);
-      lines.push(`Выбранный mapping: <#${selectedMapping.raw_channel_id}> -> <#${selectedMapping.output_channel_id}>`);
+      lines.push(`Выбранная связка: <#${selectedMapping.raw_channel_id}> -> <#${selectedMapping.output_channel_id}>`);
       lines.push(`Языки: ${selectedMapping.source_lang} -> ${selectedMapping.target_lang}`);
       lines.push(`Рендер: ${selectedMapping.render_mode} | Медиа: ${selectedMapping.media_mode}`);
       lines.push(`Glossary: ${selectedMapping.active_glossary_version_id ?? "none"}`);
       lines.push(`Статус: ${selectedMapping.is_paused === 1 ? `пауза (${selectedMapping.pause_reason ?? "без причины"})` : "активен"}`);
-      lines.push(`Очередь mapping: pending=${pending} retry=${retry} failed=${failed}`);
+      lines.push(`Очередь связки: pending=${pending} retry=${retry} failed=${failed}`);
       lines.push(`Последний raw: ${latest?.raw_message_id ?? "none"}`);
       lines.push("Быстрые действия ниже: пауза, перезапуск хвоста, retranslate последнего сообщения и glossary.");
     } else {
-      lines.push("Для этого сервера ещё нет mapping. Нажмите «Настроить mapping», чтобы создать первый.");
+      lines.push("Для этого сервера ещё нет связки каналов. Нажмите «Настроить связку», чтобы создать первую.");
     }
 
     return {
@@ -514,7 +541,7 @@ export class CommandRouter {
         .setDisabled(!selectedMapping),
       new ButtonBuilder()
         .setCustomId(`${PANEL_PREFIX}:setup-open:${this.findPanelSessionId(session)}`)
-        .setLabel("Настроить mapping")
+        .setLabel("Настроить связку")
         .setStyle(ButtonStyle.Success),
     );
 
@@ -629,12 +656,12 @@ export class CommandRouter {
     if (mapping.is_paused === 1) {
       await this.glossaryManager.validateLanguagePair(mapping.source_lang, mapping.target_lang);
       this.repositories.channelMappings.setPaused(mapping.mapping_id, false, null);
-      await this.refreshDeferredPanel(interaction, session, "Mapping снят с паузы.");
+      await this.refreshDeferredPanel(interaction, session, "Связка снята с паузы.");
       return;
     }
 
     this.repositories.channelMappings.setPaused(mapping.mapping_id, true, "Paused from /panel");
-    await this.refreshDeferredPanel(interaction, session, "Mapping поставлен на паузу.");
+    await this.refreshDeferredPanel(interaction, session, "Связка поставлена на паузу.");
   }
 
   private async handlePanelRetranslateLatest(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
@@ -642,11 +669,11 @@ export class CommandRouter {
     const mapping = this.requireSelectedMapping(session);
     const latestRaw = this.repositories.processedRawMessages.getLatestForMapping(mapping.mapping_id);
     if (!latestRaw) {
-      throw new AppError({ code: "LATEST_RAW_NOT_FOUND", message: "Для mapping ещё нет raw сообщений.", failureClass: "validation" });
+      throw new AppError({ code: "LATEST_RAW_NOT_FOUND", message: "Для этой связки ещё нет raw сообщений.", failureClass: "validation" });
     }
 
     await this.scheduleRetranslate(latestRaw.raw_message_id);
-    await this.refreshDeferredPanel(interaction, session, `Retranslate запланирован для ${latestRaw.raw_message_id}.`);
+    await this.refreshDeferredPanel(interaction, session, `Повторный перевод запланирован для ${latestRaw.raw_message_id}.`);
   }
 
   private async handlePanelRestartBacklog(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
@@ -792,7 +819,7 @@ export class CommandRouter {
     session.view = "main";
     session.updatedAt = Date.now();
     await interaction.editReply({
-      ...this.buildPanelMessage(session, `Mapping сохранен. ${result.summaryLines.join(" | ")}`),
+      ...this.buildPanelMessage(session, `Связка сохранена. ${result.summaryLines.join(" | ")}`),
     });
   }
 
@@ -802,7 +829,7 @@ export class CommandRouter {
     const modal = new ModalBuilder().setCustomId(customId).setTitle("Массовый импорт Glossary");
     const payloadInput = new TextInputBuilder()
       .setCustomId("payload")
-      .setLabel("Вставьте блок с персонажами, скиллами и терминами")
+      .setLabel("Вставьте glossary payload")
       .setStyle(TextInputStyle.Paragraph)
       .setPlaceholder("[characters]\nGojo\nSukuna\n\n[skills]\nBlack Flash\n\n[terms]\nawakening = пробуждение")
       .setRequired(true)
@@ -812,9 +839,10 @@ export class CommandRouter {
   }
 
   private async handlePanelGlossaryList(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const mapping = this.requireSelectedMapping(session);
     const lines = this.formatGlossaryLines(session.guildId, mapping.source_lang, mapping.target_lang);
-    await interaction.reply({ content: lines.join("\n").slice(0, 1_950), flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ content: lines.join("\n").slice(0, 1_950) });
   }
 
   private async handlePanelGlossaryClearPair(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
@@ -854,7 +882,7 @@ export class CommandRouter {
   private requireSelectedMapping(session: PanelSession): ChannelMappingRow {
     const mapping = session.selectedMappingId ? this.repositories.channelMappings.getByMappingId(session.selectedMappingId) : null;
     if (!mapping) {
-      throw new AppError({ code: "PANEL_MAPPING_REQUIRED", message: "Сначала выберите mapping в панели.", failureClass: "validation" });
+      throw new AppError({ code: "PANEL_MAPPING_REQUIRED", message: "Сначала выберите связку каналов в панели.", failureClass: "validation" });
     }
     return mapping;
   }
@@ -1033,7 +1061,7 @@ export class CommandRouter {
     });
 
     await interaction.reply({
-      content: `${dryRun ? "Dry-run OK" : "Mapping сохранен."}\n${result.summaryLines.join("\n")}`,
+      content: `${dryRun ? "Dry-run OK" : "Связка сохранена."}\n${result.summaryLines.join("\n")}`,
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -1155,7 +1183,7 @@ export class CommandRouter {
 
     await this.scheduleRetranslate(rawMessageId);
 
-    await interaction.reply({ content: `Retranslate запланирован для raw message ${rawMessageId}.`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `Повторный перевод запланирован для raw message ${rawMessageId}.`, flags: MessageFlags.Ephemeral });
   }
 
   private async handleGlossary(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1254,15 +1282,32 @@ export class CommandRouter {
       }
 
       case "import": {
+        const attachment = interaction.options.getAttachment("file");
         const dryRun = interaction.options.getBoolean("dry_run") ?? false;
         const replaceExisting = interaction.options.getBoolean("replace_existing") ?? false;
+        if (attachment) {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const payload = await this.downloadGlossaryAttachment(attachment);
+          const result = await this.runGlossaryImport({
+            guildId,
+            actorUserId: interaction.user.id,
+            sourceLang,
+            targetLang,
+            payload,
+            dryRun,
+            replaceExisting,
+          });
+          await interaction.editReply({ content: this.formatGlossaryImportResult(result) });
+          break;
+        }
+
         // Encode parameters in the modal customId so they survive until submit
         // Use | as delimiter (cannot appear in language codes like EN, RU)
         const customId = `glossary_import|${sourceLang}|${targetLang}|${dryRun}|${replaceExisting}`;
         const modal = new ModalBuilder().setCustomId(customId).setTitle("Массовый импорт Glossary");
         const payloadInput = new TextInputBuilder()
           .setCustomId("payload")
-          .setLabel("Вставьте блок с персонажами, скиллами и терминами")
+          .setLabel("Вставьте glossary payload")
           .setStyle(TextInputStyle.Paragraph)
           .setPlaceholder(
             "[characters]\nGojo\nSukuna\n\n[skills]\nBlack Flash\n\n[terms]\nawakening = Awakening (пробуждение)",
@@ -1323,124 +1368,209 @@ export class CommandRouter {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
-      // Parse encoded parameters from customId: glossary_import|SRC|TGT|dryRun|replaceExisting
       const parts = interaction.customId.split("|");
       const sourceLang = (parts[1] || this.config.defaultSourceLanguage).toUpperCase();
       const targetLang = (parts[2] || this.config.defaultTargetLanguage).toUpperCase();
       const dryRun = parts[3] === "true";
       const replaceExisting = parts[4] === "true";
-
-      const guildId = interaction.guildId!;
-      const payload = interaction.fields.getTextInputValue("payload");
-
-      this.logger.info({ event: "glossary_import_started", guild_id: guildId, source_lang: sourceLang, target_lang: targetLang, dry_run: dryRun, replace_existing: replaceExisting }, "Glossary bulk import started");
-
-      // 1. Parse
-      const { entries, errors: parseErrors } = parseBulkGlossaryPayload(payload);
-      this.logger.info({ event: "glossary_import_parsed", guild_id: guildId, parsed: entries.length, parse_errors: parseErrors.length }, "Glossary bulk import parsed");
-
-      if (parseErrors.length > 0 && entries.length === 0) {
-        await interaction.editReply({
-          content: `Ошибки парсинга payload (${parseErrors.length}):\n${formatParseErrors(parseErrors)}\n\nНи одной записи не добавлено.`,
-        });
-        return;
-      }
-
-      if (entries.length === 0) {
-        await interaction.editReply({ content: "Payload не содержит ни одной валидной записи. Проверьте формат." });
-        return;
-      }
-
-      // 2. Validate guild and pair
-      const guildSettings = this.repositories.guildSettings.getByGuildId(guildId);
-      if (!guildSettings) {
-        await interaction.editReply({ content: "Сервер не инициализирован. Сначала выполните /setup." });
-        return;
-      }
-
-      await this.glossaryManager.validateLanguagePair(sourceLang, targetLang);
-
-      if (dryRun) {
-        // Dry-run: compute what would happen without writing to DB
-        let wouldAdd = 0;
-        let wouldUpdate = 0;
-        let wouldSkip = 0;
-        for (const entry of entries) {
-          const existing = this.repositories.glossaryRules.getActiveRule(guildId, sourceLang, targetLang, entry.sourceTerm);
-          if (!existing) {
-            wouldAdd++;
-          } else if (existing.rule_type === entry.mode && existing.target_term === entry.targetTerm) {
-            wouldSkip++;
-          } else if (replaceExisting) {
-            wouldUpdate++;
-          } else {
-            wouldSkip++;
-          }
-        }
-        const errLine = parseErrors.length > 0 ? `\nParse warnings: ${parseErrors.length}\n${formatParseErrors(parseErrors, 5)}` : "";
-        await interaction.editReply({
-          content: [
-            "**Dry-run glossary import OK.**",
-            `Pair: ${sourceLang} -> ${targetLang}`,
-            `Parsed: ${entries.length}`,
-            `Would add: ${wouldAdd}`,
-            `Would update: ${wouldUpdate}`,
-            `Would skip: ${wouldSkip}`,
-            `Errors: ${parseErrors.length}`,
-            errLine,
-          ].filter(Boolean).join("\n"),
-        });
-        return;
-      }
-
-      // 3. Apply in one DB transaction
-      this.logger.info({ event: "glossary_import_db_apply", guild_id: guildId, entries: entries.length }, "Applying glossary bulk import to DB");
-      const { added, updated, skipped } = this.repositories.glossaryRules.bulkUpsertRules({
-        guildId,
+      const result = await this.runGlossaryImport({
+        guildId: interaction.guildId!,
+        actorUserId: interaction.user.id,
         sourceLang,
         targetLang,
-        entries,
+        payload: interaction.fields.getTextInputValue("payload"),
+        dryRun,
         replaceExisting,
-        userId: interaction.user.id,
       });
-      this.logger.info({ event: "glossary_import_db_applied", guild_id: guildId, added, updated, skipped }, "Glossary bulk import applied to DB");
-
-      // 4. Sync with DeepL once
-      let activeVersionId: string | null = null;
-      if (added > 0 || updated > 0) {
-        this.logger.info({ event: "glossary_import_deepl_sync_started", guild_id: guildId }, "DeepL glossary sync started");
-        const synced = await this.glossaryManager.syncRulesForPair({ guildId, sourceLang, targetLang });
-        this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, synced.glossary_version_id);
-        activeVersionId = synced.glossary_version_id;
-        this.logger.info({ event: "glossary_import_deepl_sync_completed", guild_id: guildId, version_id: activeVersionId }, "DeepL glossary sync completed");
-      } else {
-        activeVersionId = this.repositories.glossaryVersions.getActiveByPair(guildId, sourceLang, targetLang)?.glossary_version_id ?? null;
-      }
-
-      this.logger.info({ event: "glossary_import_finished", guild_id: guildId, added, updated, skipped, version_id: activeVersionId }, "Glossary bulk import finished");
-
-      const errLine = parseErrors.length > 0 ? `\nParse warnings: ${parseErrors.length}\n${formatParseErrors(parseErrors, 5)}` : "";
-      await interaction.editReply({
-        content: [
-          "**Импорт glossary завершён.**",
-          `Pair: ${sourceLang} -> ${targetLang}`,
-          `Parsed: ${entries.length}`,
-          `Added: ${added}`,
-          `Updated: ${updated}`,
-          `Skipped: ${skipped}`,
-          `Errors: ${parseErrors.length}`,
-          `Active glossary version: ${activeVersionId ?? "none"}`,
-          errLine,
-        ].filter(Boolean).join("\n"),
-      });
+      await interaction.editReply({ content: this.formatGlossaryImportResult(result) });
     } catch (error) {
+      const appError = error instanceof AppError ? error : null;
       this.logger.error(
-        { event: "glossary_import_failed", error: error instanceof Error ? error.message : String(error) },
-        "Glossary bulk import failed",
+        {
+          event: "glossary_import_failed",
+          error_code: appError?.code,
+          error_details: appError?.details,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        `Glossary bulk import failed (code=${appError?.code ?? "unknown"}): ${error instanceof Error ? error.message : String(error)}`,
       );
-      const message = error instanceof AppError ? error.message : "Импорт завершился ошибкой. Проверьте логи.";
+      const message = appError ? this.formatAppErrorForDiscord(appError) : "Импорт завершился ошибкой. Проверьте логи.";
       await interaction.editReply({ content: message });
     }
+  }
+
+  private async downloadGlossaryAttachment(attachment: Attachment): Promise<string> {
+    if (attachment.size > 128_000) {
+      throw new AppError({
+        code: "GLOSSARY_ATTACHMENT_TOO_LARGE",
+        message: "Файл glossary слишком большой. Используйте файл до 128 KB.",
+        failureClass: "validation",
+      });
+    }
+
+    const response = await fetch(attachment.url);
+    if (!response.ok) {
+      throw new AppError({
+        code: "GLOSSARY_ATTACHMENT_DOWNLOAD_FAILED",
+        message: `Не удалось скачать файл glossary (${response.status}).`,
+        failureClass: "validation",
+      });
+    }
+
+    return await response.text();
+  }
+
+  private async runGlossaryImport(input: {
+    guildId: string;
+    actorUserId: string;
+    sourceLang: string;
+    targetLang: string;
+    payload: string;
+    dryRun: boolean;
+    replaceExisting: boolean;
+  }): Promise<{
+    sourceLang: string;
+    targetLang: string;
+    parsed: number;
+    added: number;
+    updated: number;
+    skipped: number;
+    errors: number;
+    parseWarnings: string;
+    activeVersionId: string | null;
+    dryRun: boolean;
+  }> {
+    this.logger.info(
+      {
+        event: "glossary_import_started",
+        guild_id: input.guildId,
+        source_lang: input.sourceLang,
+        target_lang: input.targetLang,
+        dry_run: input.dryRun,
+        replace_existing: input.replaceExisting,
+      },
+      `Glossary import started (${input.sourceLang}->${input.targetLang}, dry_run=${input.dryRun}, replace_existing=${input.replaceExisting})`,
+    );
+
+    const { entries, errors: parseErrors } = parseBulkGlossaryPayload(input.payload);
+    if (parseErrors.length > 0 && entries.length === 0) {
+      throw new AppError({
+        code: "GLOSSARY_IMPORT_PARSE_FAILED",
+        message: `Ошибки парсинга payload (${parseErrors.length}):\n${formatParseErrors(parseErrors)}`,
+        failureClass: "validation",
+      });
+    }
+
+    if (entries.length === 0) {
+      throw new AppError({
+        code: "GLOSSARY_IMPORT_EMPTY",
+        message: "Payload не содержит ни одной валидной записи. Проверьте формат.",
+        failureClass: "validation",
+      });
+    }
+
+    const guildSettings = this.repositories.guildSettings.getByGuildId(input.guildId);
+    if (!guildSettings) {
+      throw new AppError({
+        code: "GUILD_NOT_INITIALIZED",
+        message: "Сервер не инициализирован. Сначала выполните /setup.",
+        failureClass: "validation",
+      });
+    }
+
+    await this.glossaryManager.validateLanguagePair(input.sourceLang, input.targetLang);
+
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
+
+    if (input.dryRun) {
+      for (const entry of entries) {
+        const existing = this.repositories.glossaryRules.getActiveRule(input.guildId, input.sourceLang, input.targetLang, entry.sourceTerm);
+        if (!existing) {
+          added++;
+        } else if (existing.rule_type === entry.mode && existing.target_term === entry.targetTerm) {
+          skipped++;
+        } else if (input.replaceExisting) {
+          updated++;
+        } else {
+          skipped++;
+        }
+      }
+    } else {
+      const dbResult = this.repositories.glossaryRules.bulkUpsertRules({
+        guildId: input.guildId,
+        sourceLang: input.sourceLang,
+        targetLang: input.targetLang,
+        entries,
+        replaceExisting: input.replaceExisting,
+        userId: input.actorUserId,
+      });
+      added = dbResult.added;
+      updated = dbResult.updated;
+      skipped = dbResult.skipped;
+    }
+
+    let activeVersionId = this.repositories.glossaryVersions.getActiveByPair(input.guildId, input.sourceLang, input.targetLang)?.glossary_version_id ?? null;
+    if (!input.dryRun && (added > 0 || updated > 0)) {
+      const synced = await this.glossaryManager.syncRulesForPair({
+        guildId: input.guildId,
+        sourceLang: input.sourceLang,
+        targetLang: input.targetLang,
+      });
+      this.repositories.channelMappings.updateActiveGlossaryForPair(input.guildId, input.sourceLang, input.targetLang, synced.glossary_version_id);
+      activeVersionId = synced.glossary_version_id;
+    }
+
+    return {
+      sourceLang: input.sourceLang,
+      targetLang: input.targetLang,
+      parsed: entries.length,
+      added,
+      updated,
+      skipped,
+      errors: parseErrors.length,
+      parseWarnings: parseErrors.length > 0 ? formatParseErrors(parseErrors, 5) : "",
+      activeVersionId,
+      dryRun: input.dryRun,
+    };
+  }
+
+  private formatGlossaryImportResult(result: {
+    sourceLang: string;
+    targetLang: string;
+    parsed: number;
+    added: number;
+    updated: number;
+    skipped: number;
+    errors: number;
+    parseWarnings: string;
+    activeVersionId: string | null;
+    dryRun: boolean;
+  }): string {
+    const lines = [
+      result.dryRun ? "**Dry-run glossary import OK.**" : "**Импорт glossary завершён.**",
+      `Pair: ${result.sourceLang} -> ${result.targetLang}`,
+      `Parsed: ${result.parsed}`,
+      result.dryRun ? `Would add: ${result.added}` : `Added: ${result.added}`,
+      result.dryRun ? `Would update: ${result.updated}` : `Updated: ${result.updated}`,
+      `Skipped: ${result.skipped}`,
+      `Warnings: ${result.errors}`,
+      `Active glossary version: ${result.activeVersionId ?? "none"}`,
+    ];
+    if (result.parseWarnings) {
+      lines.push("", `Parse warnings:\n${result.parseWarnings}`);
+    }
+    return lines.join("\n").slice(0, 1_950);
+  }
+
+  private formatAppErrorForDiscord(error: AppError): string {
+    const details = typeof error.details?.body === "string" ? error.details.body : null;
+    if (!details) {
+      return error.message;
+    }
+
+    return `${error.message}\nDeepL/details: ${details.slice(0, 250)}`;
   }
 
   private hasAdminAccess(member: GuildMember): boolean {
