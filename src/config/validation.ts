@@ -3,6 +3,19 @@ import { z } from "zod";
 import { AppConfig } from "../domain/types";
 import { DEFAULTS } from "./defaults";
 
+// z.coerce.boolean() converts any non-empty string to true (including "false").
+// This helper correctly parses typical env-var boolean representations.
+function envBoolean() {
+  return z.preprocess((val) => {
+    if (typeof val === "string") {
+      const lower = val.trim().toLowerCase();
+      if (lower === "" || lower === "0" || lower === "false" || lower === "no") return false;
+      return true;
+    }
+    return Boolean(val);
+  }, z.boolean());
+}
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("production"),
   DISCORD_TOKEN: z.string().min(1),
@@ -20,11 +33,11 @@ const envSchema = z.object({
   MAX_RETRY_ATTEMPTS: z.coerce.number().int().min(0).max(10).default(DEFAULTS.maxRetryAttempts),
   JOB_LEASE_SECONDS: z.coerce.number().int().min(30).default(DEFAULTS.jobLeaseSeconds),
   RETRY_BASE_SECONDS: z.coerce.number().int().min(10).default(DEFAULTS.retryBaseSeconds),
-  PUBLISH_ORIGINAL_ON_EXHAUSTED_TRANSIENT_FAILURE: z.coerce.boolean().default(
+  PUBLISH_ORIGINAL_ON_EXHAUSTED_TRANSIENT_FAILURE: envBoolean().default(
     DEFAULTS.publishOriginalOnExhaustedTransientFailure,
   ),
-  HEALTH_SERVER_ENABLED: z.coerce.boolean().default(DEFAULTS.healthServerEnabled),
-  METRICS_ENABLED: z.coerce.boolean().default(DEFAULTS.metricsEnabled),
+  HEALTH_SERVER_ENABLED: envBoolean().default(DEFAULTS.healthServerEnabled),
+  METRICS_ENABLED: envBoolean().default(DEFAULTS.metricsEnabled),
   SOURCE_DUPLICATE_WINDOW_SECONDS: z.coerce.number().int().min(0).default(DEFAULTS.sourceDuplicateWindowSeconds),
   ATTACHMENT_MIRROR_MAX_BYTES: z.coerce.number().int().positive().default(DEFAULTS.attachmentMirrorMaxBytes),
   RAILWAY_VOLUME_MOUNT_PATH: z.string().optional(),
@@ -38,9 +51,9 @@ const envSchema = z.object({
     DEFAULTS.railwayDeploymentOverlapSeconds,
   ),
   DEV_GUILD_ID: z.string().regex(/^\d+$/).optional().or(z.literal("")),
-  MOCK_DEEPL: z.coerce.boolean().default(DEFAULTS.mockDeepl),
-  SKIP_STARTUP_DEPENDENCY_CHECKS: z.coerce.boolean().default(DEFAULTS.skipStartupDependencyChecks),
-  REQUIRE_PERSISTENT_VOLUME: z.coerce.boolean().default(DEFAULTS.requirePersistentVolume),
+  MOCK_DEEPL: envBoolean().default(DEFAULTS.mockDeepl),
+  SKIP_STARTUP_DEPENDENCY_CHECKS: envBoolean().default(DEFAULTS.skipStartupDependencyChecks),
+  REQUIRE_PERSISTENT_VOLUME: envBoolean().default(DEFAULTS.requirePersistentVolume),
 });
 
 export function validateAndBuildConfig(env: NodeJS.ProcessEnv): AppConfig {

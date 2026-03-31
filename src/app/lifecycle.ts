@@ -106,9 +106,17 @@ export class BotApplication {
         node_env: this.config.nodeEnv,
         database_path: this.config.databasePath,
         railway_volume_mount_path: this.config.railwayVolumeMountPath ?? null,
+        mock_deepl: this.config.mockDeepl,
       },
       "Starting application",
     );
+
+    if (this.config.mockDeepl) {
+      this.logger.warn(
+        { event: "mock_deepl_enabled" },
+        "⚠️  MOCK_DEEPL is ON — DeepL API will NOT be called. Translations will be fake. Set MOCK_DEEPL=false or remove it to use real DeepL.",
+      );
+    }
 
     this.gatewayListener.register();
     this.client.on("interactionCreate", (interaction) => {
