@@ -162,4 +162,26 @@ export class GlossaryRulesRepository {
     tx();
     return { added, updated, skipped };
   }
+
+  archiveAllByPair(guildId: string, sourceLang: string, targetLang: string, userId: string): number {
+    const result = this.db
+      .prepare(
+        `UPDATE glossary_rules
+         SET status = 'archived', updated_by_user_id = ?, updated_at = ?
+         WHERE guild_id = ? AND source_lang = ? AND target_lang = ? AND status = 'active'`,
+      )
+      .run(userId, nowIso(), guildId, sourceLang, targetLang);
+    return result.changes;
+  }
+
+  archiveAllByGuild(guildId: string, userId: string): number {
+    const result = this.db
+      .prepare(
+        `UPDATE glossary_rules
+         SET status = 'archived', updated_by_user_id = ?, updated_at = ?
+         WHERE guild_id = ? AND status = 'active'`,
+      )
+      .run(userId, nowIso(), guildId);
+    return result.changes;
+  }
 }

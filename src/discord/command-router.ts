@@ -10,6 +10,7 @@ import {
   Client,
   GuildMember,
   MessageComponentInteraction,
+  MessageFlags,
   ModalBuilder,
   ModalSubmitInteraction,
   PermissionFlagsBits,
@@ -80,7 +81,7 @@ export class CommandRouter {
 
   async handleInteraction(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild() || !interaction.guild) {
-      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", ephemeral: true });
+      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -88,7 +89,7 @@ export class CommandRouter {
       const guild = interaction.guild;
       const member = await guild.members.fetch(interaction.user.id);
       if (!this.hasAdminAccess(member)) {
-        await interaction.reply({ content: "Недостаточно прав для использования этой команды.", ephemeral: true });
+        await interaction.reply({ content: "Недостаточно прав для использования этой команды.", flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -115,7 +116,7 @@ export class CommandRouter {
           await this.handleGlossary(interaction);
           break;
         default:
-          await interaction.reply({ content: "Неизвестная команда.", ephemeral: true });
+          await interaction.reply({ content: "Неизвестная команда.", flags: MessageFlags.Ephemeral });
       }
     } catch (error) {
       this.logger.error(
@@ -130,7 +131,7 @@ export class CommandRouter {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: message });
       } else {
-        await interaction.reply({ content: message, ephemeral: true });
+        await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
       }
     }
   }
@@ -139,13 +140,13 @@ export class CommandRouter {
     interaction: ButtonInteraction | ChannelSelectMenuInteraction | StringSelectMenuInteraction,
   ): Promise<void> {
     if (!interaction.inGuild() || !interaction.guild) {
-      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", ephemeral: true });
+      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", flags: MessageFlags.Ephemeral });
       return;
     }
 
     const member = await interaction.guild.members.fetch(interaction.user.id);
     if (!this.hasAdminAccess(member)) {
-      await interaction.reply({ content: "Недостаточно прав для использования этой команды.", ephemeral: true });
+      await interaction.reply({ content: "Недостаточно прав для использования этой команды.", flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -203,8 +204,14 @@ export class CommandRouter {
         case "glossary-list":
           await this.handlePanelGlossaryList(interaction as ButtonInteraction, session);
           break;
+        case "glossary-clear-pair":
+          await this.handlePanelGlossaryClearPair(interaction as ButtonInteraction, session);
+          break;
+        case "glossary-clear-all":
+          await this.handlePanelGlossaryClearAll(interaction as ButtonInteraction, session);
+          break;
         default:
-          await interaction.reply({ content: "Неизвестное действие панели.", ephemeral: true });
+          await interaction.reply({ content: "Неизвестное действие панели.", flags: MessageFlags.Ephemeral });
       }
     } catch (error) {
       this.logger.error(
@@ -217,9 +224,9 @@ export class CommandRouter {
       );
       const message = error instanceof AppError ? error.message : "Панель завершилась ошибкой.";
       if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: message, ephemeral: true });
+        await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral });
       } else {
-        await interaction.reply({ content: message, ephemeral: true });
+        await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
       }
     }
   }
@@ -284,6 +291,14 @@ export class CommandRouter {
           .addStringOption((option) => option.setName("target_lang").setDescription("Язык перевода (по умолчанию из настроек)"))
           .addBooleanOption((option) => option.setName("dry_run").setDescription("Только проверка, без записи в БД"))
           .addBooleanOption((option) => option.setName("replace_existing").setDescription("Заменять существующие правила при конфликте (по умолчанию false)")),
+      )
+      .addSubcommand((subcommand) =>
+        subcommand
+          .setName("clear")
+          .setDescription("Очистить glossary: для конкретной пары или полностью для сервера")
+          .addBooleanOption((option) => option.setName("all").setDescription("Очистить ВСЕ glossary правила сервера (все пары)"))
+          .addStringOption((option) => option.setName("source_lang").setDescription("Язык источника (для очистки конкретной пары)"))
+          .addStringOption((option) => option.setName("target_lang").setDescription("Язык перевода (для очистки конкретной пары)")),
       );
 
     return [
@@ -372,7 +387,7 @@ export class CommandRouter {
 
     await interaction.reply({
       ...this.buildPanelMessage(this.getPanelSession(sessionId, interaction.user.id, interaction.guildId!)),
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -514,6 +529,15 @@ export class CommandRouter {
         .setLabel("Список glossary")
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(!selectedMapping),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:glossary-clear-pair:${this.findPanelSessionId(session)}`)
+        .setLabel("Очистить glossary пары")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(!selectedMapping),
+      new ButtonBuilder()
+        .setCustomId(`${PANEL_PREFIX}:glossary-clear-all:${this.findPanelSessionId(session)}`)
+        .setLabel("Очистить весь glossary")
+        .setStyle(ButtonStyle.Danger),
     );
 
     return [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(mappingMenu), buttons, glossaryButtons];
@@ -719,17 +743,17 @@ export class CommandRouter {
 
   private async handlePanelSetupModal(interaction: ModalSubmitInteraction): Promise<void> {
     if (!interaction.inGuild() || !interaction.guild) {
-      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", ephemeral: true });
+      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", flags: MessageFlags.Ephemeral });
       return;
     }
 
     const member = await interaction.guild.members.fetch(interaction.user.id);
     if (!this.hasAdminAccess(member)) {
-      await interaction.reply({ content: "Недостаточно прав для использования этой команды.", ephemeral: true });
+      await interaction.reply({ content: "Недостаточно прав для использования этой команды.", flags: MessageFlags.Ephemeral });
       return;
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const [, , sessionId] = interaction.customId.split(":");
     const session = this.getPanelSession(sessionId, interaction.user.id, interaction.guildId!);
@@ -790,7 +814,41 @@ export class CommandRouter {
   private async handlePanelGlossaryList(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
     const mapping = this.requireSelectedMapping(session);
     const lines = this.formatGlossaryLines(session.guildId, mapping.source_lang, mapping.target_lang);
-    await interaction.reply({ content: lines.join("\n").slice(0, 1_950), ephemeral: true });
+    await interaction.reply({ content: lines.join("\n").slice(0, 1_950), flags: MessageFlags.Ephemeral });
+  }
+
+  private async handlePanelGlossaryClearPair(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    await interaction.deferUpdate();
+    const mapping = this.requireSelectedMapping(session);
+    const archived = this.repositories.glossaryRules.archiveAllByPair(
+      session.guildId, mapping.source_lang, mapping.target_lang, interaction.user.id,
+    );
+    if (archived > 0) {
+      this.repositories.channelMappings.updateActiveGlossaryForPair(session.guildId, mapping.source_lang, mapping.target_lang, null);
+    }
+    await this.refreshDeferredPanel(
+      interaction, session,
+      archived > 0
+        ? `Glossary ${mapping.source_lang} -> ${mapping.target_lang} очищен: ${archived} правил(о) архивировано.`
+        : `Активных glossary правил для ${mapping.source_lang} -> ${mapping.target_lang} не найдено.`,
+    );
+  }
+
+  private async handlePanelGlossaryClearAll(interaction: ButtonInteraction, session: PanelSession): Promise<void> {
+    await interaction.deferUpdate();
+    const archived = this.repositories.glossaryRules.archiveAllByGuild(session.guildId, interaction.user.id);
+    if (archived > 0) {
+      const allMappings = this.repositories.channelMappings.listByGuildId(session.guildId);
+      for (const m of allMappings) {
+        this.repositories.channelMappings.updateActiveGlossaryForPair(session.guildId, m.source_lang, m.target_lang, null);
+      }
+    }
+    await this.refreshDeferredPanel(
+      interaction, session,
+      archived > 0
+        ? `Весь glossary сервера очищен: ${archived} правил(о) архивировано.`
+        : "Активных glossary правил на сервере не найдено.",
+    );
   }
 
   private requireSelectedMapping(session: PanelSession): ChannelMappingRow {
@@ -976,7 +1034,7 @@ export class CommandRouter {
 
     await interaction.reply({
       content: `${dryRun ? "Dry-run OK" : "Mapping сохранен."}\n${result.summaryLines.join("\n")}`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -1044,7 +1102,7 @@ export class CommandRouter {
       lines.push(...(recentFailures.length > 0 ? recentFailures.map((failure) => `- [${failure.failure_code}] ${failure.failure_summary.slice(0, MAX_FAILURE_SUMMARY_LENGTH)} (attempt=${failure.attempt_count})`) : ["- none"]));
     }
 
-    await interaction.reply({ content: lines.join("\n").slice(0, 1_950), ephemeral: true });
+    await interaction.reply({ content: lines.join("\n").slice(0, 1_950), flags: MessageFlags.Ephemeral });
   }
 
   private async handlePause(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1052,7 +1110,7 @@ export class CommandRouter {
     mappings.forEach((mapping) => this.repositories.channelMappings.setPaused(mapping.mapping_id, true, "Paused by admin"));
     await interaction.reply({
       content: `Пауза включена для ${mappings.length} mapping(s).`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -1062,7 +1120,7 @@ export class CommandRouter {
       await this.glossaryManager.validateLanguagePair(mapping.source_lang, mapping.target_lang);
       this.repositories.channelMappings.setPaused(mapping.mapping_id, false, null);
     }
-    await interaction.reply({ content: `Resume выполнен для ${mappings.length} mapping(s).`, ephemeral: true });
+    await interaction.reply({ content: `Resume выполнен для ${mappings.length} mapping(s).`, flags: MessageFlags.Ephemeral });
   }
 
   private async handleRetranslate(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1097,7 +1155,7 @@ export class CommandRouter {
 
     await this.scheduleRetranslate(rawMessageId);
 
-    await interaction.reply({ content: `Retranslate запланирован для raw message ${rawMessageId}.`, ephemeral: true });
+    await interaction.reply({ content: `Retranslate запланирован для raw message ${rawMessageId}.`, flags: MessageFlags.Ephemeral });
   }
 
   private async handleGlossary(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1133,7 +1191,7 @@ export class CommandRouter {
         this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, synced.glossary_version_id);
         await interaction.reply({
           content: `Glossary правило добавлено. Активна версия ${synced.glossary_version_id} (${sourceLang} -> ${targetLang}).`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         break;
       }
@@ -1150,7 +1208,7 @@ export class CommandRouter {
           this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, null);
           await interaction.reply({
             content: "Правило удалено. В паре больше нет активных glossary правил, mappings останутся без активного glossary до следующего /glossary add.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -1159,7 +1217,7 @@ export class CommandRouter {
         this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, synced.glossary_version_id);
         await interaction.reply({
           content: `Правило удалено. Активирована версия ${synced.glossary_version_id}.`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         break;
       }
@@ -1170,7 +1228,7 @@ export class CommandRouter {
         const lines = rules.map((rule) => `- [${rule.status}] ${rule.source_lang}->${rule.target_lang} ${rule.source_term} => ${rule.rule_type === "preserve" ? "(preserve)" : (rule.target_term ?? "")}`);
         await interaction.reply({
           content: lines.length > 0 ? lines.join("\n").slice(0, 1_950) : "Glossary правил пока нет.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         break;
       }
@@ -1190,7 +1248,7 @@ export class CommandRouter {
             "Preview:",
             preview.previewText,
           ].join("\n").slice(0, 1_950),
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         break;
       }
@@ -1215,23 +1273,54 @@ export class CommandRouter {
         await interaction.showModal(modal);
         break;
       }
+
+      case "clear": {
+        const clearAll = interaction.options.getBoolean("all") ?? false;
+        if (clearAll) {
+          const archived = this.repositories.glossaryRules.archiveAllByGuild(guildId, interaction.user.id);
+          if (archived === 0) {
+            await interaction.reply({ content: "Активных glossary правил на сервере не найдено.", flags: MessageFlags.Ephemeral });
+            return;
+          }
+          const allMappings = this.repositories.channelMappings.listByGuildId(guildId);
+          for (const m of allMappings) {
+            this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, m.source_lang, m.target_lang, null);
+          }
+          await interaction.reply({
+            content: `Glossary полностью очищен: ${archived} правил(о) архивировано. Active glossary версия сброшена для всех mapping.`,
+            flags: MessageFlags.Ephemeral,
+          });
+        } else {
+          const archived = this.repositories.glossaryRules.archiveAllByPair(guildId, sourceLang, targetLang, interaction.user.id);
+          if (archived === 0) {
+            await interaction.reply({ content: `Активных glossary правил для ${sourceLang} -> ${targetLang} не найдено.`, flags: MessageFlags.Ephemeral });
+            return;
+          }
+          this.repositories.channelMappings.updateActiveGlossaryForPair(guildId, sourceLang, targetLang, null);
+          await interaction.reply({
+            content: `Glossary ${sourceLang} -> ${targetLang} очищен: ${archived} правил(о) архивировано. Active glossary версия сброшена.`,
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+        break;
+      }
     }
   }
 
   async handleGlossaryImportModal(interaction: ModalSubmitInteraction): Promise<void> {
     if (!interaction.inGuild() || !interaction.guild) {
-      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", ephemeral: true });
+      await interaction.reply({ content: "Эта команда доступна только внутри сервера.", flags: MessageFlags.Ephemeral });
       return;
     }
 
     const guild = interaction.guild;
     const member = await guild.members.fetch(interaction.user.id);
     if (!this.hasAdminAccess(member)) {
-      await interaction.reply({ content: "Недостаточно прав для использования этой команды.", ephemeral: true });
+      await interaction.reply({ content: "Недостаточно прав для использования этой команды.", flags: MessageFlags.Ephemeral });
       return;
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
       // Parse encoded parameters from customId: glossary_import|SRC|TGT|dryRun|replaceExisting
